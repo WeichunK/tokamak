@@ -17,7 +17,7 @@ every milestone: **prove it correct, then measure what it buys.**
 | Milestone | Technique | Status |
 |---|---|---|
 | M1 | Single-sequence engine: from-scratch decoder, contiguous KV cache, sampling | ✅ |
-| M2 | Paged KV cache (block manager + paged attention) | ⬜ |
+| M2 | Paged KV cache (block manager + paged attention) | ✅ |
 | M3 | Continuous batching (iteration-level scheduling) | ⬜ |
 | M4 | Custom Triton attention kernels | ⬜ |
 | M5 | Speculative decoding (draft + rejection sampling) | ⬜ |
@@ -25,7 +25,8 @@ every milestone: **prove it correct, then measure what it buys.**
 | M7 | Experimental attention backends (sparse / linear attention) | ⬜ |
 
 Details and exit criteria per milestone: [docs/ROADMAP.md](docs/ROADMAP.md).
-Design notes: [docs/design/](docs/design/).
+Design notes: [docs/design/](docs/design/). Article drafts per milestone:
+[docs/articles/](docs/articles/).
 
 ## Quickstart
 
@@ -62,8 +63,11 @@ src/tokamak/
 ├── model/
 │   ├── layers.py         # RMSNorm, RoPE, SwiGLU — numerics match HF for parity
 │   ├── transformer.py    # GQA attention + decoder stack (Llama / Qwen2 / Qwen3)
-│   ├── kv_cache.py       # contiguous per-sequence KV cache (the M2 "before" picture)
+│   ├── kv_cache.py       # KVCacheProtocol + contiguous baseline cache
 │   └── loader.py         # safetensors → parameters, with full-coverage validation
+├── memory/
+│   ├── block_manager.py  # fixed-size KV block pool + per-sequence block tables
+│   └── paged_cache.py    # paged storage + gather-based reference paged attention
 ├── sampling/sampler.py   # temperature → top-k → top-p → multinomial
 └── engine/
     ├── llm.py            # offline LLM API: prefill + token-by-token decode
@@ -88,9 +92,11 @@ Baseline and per-milestone numbers live in [benchmarks/](benchmarks/README.md),
 including reproduction commands and methodology. The M1 naive baseline (Qwen3-0.6B,
 bf16, RTX 3080 Laptop): 66 ms prefill at 512 tokens, 19 tok/s single-sequence
 decode — deliberately unimpressive, and the whole point: each following milestone
-has to earn its complexity against these numbers. The M6 comparison against vLLM
-(same model, same traces, same GPU) comes with an honest analysis of the gap and
-where it comes from.
+has to earn its complexity against these numbers. M2's paged cache cuts KV
+reservation waste from 50.1% to 2.0% on a simulated chat workload, at a measured
+(and deliberate) 17% single-sequence decode cost for the reference gather that the
+M4 kernel exists to remove. The M6 comparison against vLLM (same model, same
+traces, same GPU) comes with an honest analysis of the gap and where it comes from.
 
 ## Development
 

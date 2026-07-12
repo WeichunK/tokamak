@@ -30,7 +30,7 @@ milestone is measured against.
 tolerance; greedy decoding is token-identical to `transformers.generate`; a latency
 baseline (prefill ms, decode tok/s) is recorded.
 
-## M2 — Paged KV cache ⬜
+## M2 — Paged KV cache ✅
 
 Block-based KV cache management in the style of vLLM's PagedAttention: a block
 manager that allocates fixed-size KV blocks from a global pool, per-sequence block
@@ -38,9 +38,12 @@ tables, and a reference paged-attention implementation in pure PyTorch. Removes 
 "one contiguous buffer per sequence" restriction and the memory fragmentation that
 comes with it.
 
-**Exit criteria:** paged attention is numerically equivalent to the contiguous
-implementation; measured KV-memory waste drops from O(max_seq_len) per sequence to
-less than one block per sequence.
+**Exit criteria (met):** paged attention is numerically equivalent to the contiguous
+implementation (bitwise on tiny models incl. fragmented pools; HF-parity on real
+weights for both backends); measured reservation waste drops from 50.1% to 2.0%
+(< 1 block/sequence). Known cost: reference gather decodes ~17% slower
+single-sequence — the recorded motivation for M4. Design notes:
+[design/002-paged-kv-cache.md](design/002-paged-kv-cache.md).
 
 ## M3 — Continuous batching ⬜
 

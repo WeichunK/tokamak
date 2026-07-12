@@ -121,8 +121,3 @@ class ContiguousKVCache:
 
     def release(self) -> None:
         """Nothing pooled to return; the buffer dies with the object."""
-
-
-# Transitional alias so consumers migrate one commit at a time; removed once the
-# engine switches to the protocol.
-KVCache = ContiguousKVCache

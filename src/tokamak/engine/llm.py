@@ -1,15 +1,20 @@
 """The offline batch inference entry point.
 
-M1 scope: requests are processed one at a time (prefill, then token-by-token decode)
-with a contiguous per-sequence KV cache. This is intentionally the simplest correct
-engine — it is the baseline that paged KV caching (M2) and continuous batching (M3)
-are measured against.
+Requests are processed one at a time (prefill, then token-by-token decode); the
+iteration-level scheduler arrives with continuous batching in M3. KV memory comes
+from one of two backends:
+
+- ``"paged"`` (default, M2): fixed-size blocks allocated on demand from a pool that
+  is preallocated once at engine startup, vLLM-style. Per-sequence waste is bounded
+  by one partial block.
+- ``"contiguous"`` (M1 baseline): one buffer per request sized for its worst case
+  (``prompt + max_new_tokens``), kept for comparison benchmarks.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import torch
 from tqdm.auto import tqdm
@@ -18,7 +23,8 @@ from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 from tokamak.config import ModelConfig, resolve_device, resolve_dtype
 from tokamak.engine.outputs import RequestOutput
 from tokamak.engine.sequence import FinishReason, Sequence, SequenceStatus
-from tokamak.model.kv_cache import KVCache
+from tokamak.memory import BlockManager, PagedKVCache, PagedKVCacheView
+from tokamak.model.kv_cache import ContiguousKVCache, KVCacheProtocol
 from tokamak.model.loader import build_model, load_weights, resolve_model_path
 from tokamak.sampling.sampler import sample
 from tokamak.sampling_params import SamplingParams
@@ -45,7 +51,12 @@ class LLM:
         dtype: ``"auto"`` (default; bfloat16 on CUDA, float32 on CPU), a torch dtype,
             or its string name.
         max_seq_len: Optional cap on context length (prompt + generation). Defaults
-            to the model's trained maximum; lowering it bounds KV-cache memory.
+            to the model's trained maximum; lowering it bounds KV-cache memory —
+            with the paged backend, the whole pool is preallocated from this value.
+        kv_backend: ``"paged"`` (default) allocates KV memory in fixed-size blocks
+            from a shared pool; ``"contiguous"`` preallocates one worst-case buffer
+            per request (the M1 baseline, kept for comparison).
+        block_size: Tokens per KV block for the paged backend.
     """
 
     def __init__(
@@ -55,7 +66,13 @@ class LLM:
         device: str | torch.device = "auto",
         dtype: str | torch.dtype = "auto",
         max_seq_len: int | None = None,
+        kv_backend: Literal["contiguous", "paged"] = "paged",
+        block_size: int = 16,
     ) -> None:
+        if kv_backend not in ("contiguous", "paged"):
+            raise ValueError(f"Unknown kv_backend: {kv_backend!r}")
+        if block_size < 1:
+            raise ValueError(f"block_size must be >= 1, got {block_size}")
         model_path = resolve_model_path(model)
         self.device = resolve_device(device)
         self.dtype = resolve_dtype(dtype, self.device)
@@ -69,12 +86,27 @@ class LLM:
         model_max = self.model_config.max_position_embeddings
         self.max_seq_len = min(max_seq_len or model_max, model_max)
 
+        self.kv_backend = kv_backend
+        self.block_manager: BlockManager | None = None
+        self.paged_cache: PagedKVCache | None = None
+        if kv_backend == "paged":
+            num_blocks = -(-self.max_seq_len // block_size)
+            self.block_manager = BlockManager(num_blocks, block_size)
+            self.paged_cache = PagedKVCache(
+                self.model_config,
+                num_blocks,
+                block_size,
+                device=self.device,
+                dtype=self.dtype,
+            )
+
         logger.info(
-            "Loading %s (%s) on %s as %s",
+            "Loading %s (%s) on %s as %s (kv_backend=%s)",
             model,
             self.model_config.architecture,
             self.device,
             self.dtype,
+            kv_backend,
         )
         self.model = build_model(self.model_config, self.device, self.dtype)
         load_weights(self.model, model_path)
@@ -159,33 +191,49 @@ class LLM:
             )
         max_total_tokens = min(self.max_seq_len, seq.num_prompt_tokens + params.max_new_tokens)
 
-        kv_cache = KVCache(
-            self.model_config,
-            max_seq_len=max_total_tokens,
-            device=self.device,
-            dtype=self.dtype,
-        )
+        kv_cache = self._make_cache(seq, max_total_tokens)
         generator: torch.Generator | None = None
         if params.seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(params.seed)
 
         seq.status = SequenceStatus.RUNNING
-        input_ids = torch.tensor([seq.prompt_token_ids], dtype=torch.long, device=self.device)
-        hidden = self.model(input_ids, kv_cache, start_pos=0)
-        token_id = self._sample_next(hidden, params, generator)
-
-        while True:
-            seq.append_output_token(token_id)
-            if not params.ignore_eos and token_id in self.model_config.eos_token_ids:
-                seq.finish(FinishReason.STOP)
-                return
-            if seq.num_tokens >= max_total_tokens:
-                seq.finish(FinishReason.LENGTH)
-                return
-
-            input_ids = torch.tensor([[token_id]], dtype=torch.long, device=self.device)
-            hidden = self.model(input_ids, kv_cache, start_pos=seq.num_tokens - 1)
+        try:
+            kv_cache.ensure_capacity(seq.num_prompt_tokens)
+            input_ids = torch.tensor([seq.prompt_token_ids], dtype=torch.long, device=self.device)
+            hidden = self.model(input_ids, kv_cache, start_pos=0)
             token_id = self._sample_next(hidden, params, generator)
+
+            while True:
+                seq.append_output_token(token_id)
+                if not params.ignore_eos and token_id in self.model_config.eos_token_ids:
+                    seq.finish(FinishReason.STOP)
+                    return
+                if seq.num_tokens >= max_total_tokens:
+                    seq.finish(FinishReason.LENGTH)
+                    return
+
+                kv_cache.ensure_capacity(seq.num_tokens)
+                input_ids = torch.tensor([[token_id]], dtype=torch.long, device=self.device)
+                hidden = self.model(input_ids, kv_cache, start_pos=seq.num_tokens - 1)
+                token_id = self._sample_next(hidden, params, generator)
+        finally:
+            kv_cache.release()
+
+    def _make_cache(self, seq: Sequence, max_total_tokens: int) -> KVCacheProtocol:
+        """Build the per-request KV cache for the configured backend.
+
+        Contiguous reserves ``max_total_tokens`` up front; paged starts empty and
+        grows block by block via ``ensure_capacity`` as the sequence advances.
+        """
+        if self.kv_backend == "paged":
+            assert self.paged_cache is not None and self.block_manager is not None
+            return PagedKVCacheView(self.paged_cache, self.block_manager, seq.seq_id)
+        return ContiguousKVCache(
+            self.model_config,
+            max_seq_len=max_total_tokens,
+            device=self.device,
+            dtype=self.dtype,
+        )
 
     def _decode(self, token_ids: list[int]) -> str:
         """Detokenize generated ids, stripping special tokens."""

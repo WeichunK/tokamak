@@ -17,15 +17,42 @@ Numbers below are medians over 3 iterations after 1 warmup run.
 
 Workload: 512 synthetic prompt tokens, 128 greedy decode steps, EOS ignored.
 
-| Milestone | Prefill (ms) | Decode (tok/s) | Inter-token (ms) | Peak mem (GiB) |
+| Milestone / backend | Prefill (ms) | Decode (tok/s) | Inter-token (ms) | Peak mem (GiB) |
 |---|---|---|---|---|
-| M1 — naive baseline | 66.3 | 19.0 | 52.6 | 1.40 |
+| M1 — contiguous baseline | 66.3 | 19.0 | 52.6 | 1.40 |
+| M2 — paged, reference gather (block 16) | 73.5 | 15.8 | 63.3 | 1.47 |
 
-The decode number is the point: a 0.6B model on a 16 GiB GPU decoding at 19 tok/s
-means the GPU is idle most of every step — single-sequence, eager-mode decoding is
-launch-latency-bound, not compute-bound. Quantifying how much of that gap each
-technique closes (batching, kernels, speculative decoding) is what the following
-milestones are for.
+The M1 decode number is the point: a 0.6B model on a 16 GiB GPU decoding at
+19 tok/s means the GPU is idle most of every step — single-sequence, eager-mode
+decoding is launch-latency-bound, not compute-bound. Quantifying how much of that
+gap each technique closes (batching, kernels, speculative decoding) is what the
+following milestones are for.
+
+The M2 paged backend is ~17% *slower* per sequence, deliberately: the reference
+implementation materializes K/V through a gather every layer and step so that
+correctness stays auditable. That regression is the measured motivation for the
+M4 attention kernel, which reads block tables in-kernel instead of copying.
+
+## KV reservation waste (`benchmark_kv_memory.py`)
+
+Allocator-policy simulation, no GPU: 2,000 requests, log-normal prompts
+(median 150 tokens), early-stopping generation (median 128 of a 512-token budget),
+waste integrated over each request's lifetime.
+
+| Policy | Reserved-but-unused KV |
+|---|---|
+| Contiguous (`prompt + max_new_tokens` up front) | 50.1% |
+| Paged (block_size = 16) | 2.0% |
+
+Paged holds 50.9% of the contiguous reservation — the same pool fits ~1.96×
+the concurrent sequences, which is the capacity that continuous batching (M3)
+converts into throughput.
+
+```bash
+uv run python benchmarks/benchmark_latency.py --kv-backend paged
+uv run python benchmarks/benchmark_latency.py --kv-backend contiguous
+uv run python benchmarks/benchmark_kv_memory.py
+```
 
 Reproduce with:
 

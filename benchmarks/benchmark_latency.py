@@ -1,12 +1,14 @@
 """Single-sequence latency benchmark: prefill time and decode throughput.
 
-Measures the M1 baseline that later milestones (paged KV cache, continuous batching,
-custom kernels, speculative decoding) are compared against. Prompts are synthetic
-random token ids — content does not affect compute — and EOS is ignored so every run
-decodes exactly the requested number of tokens.
+Measures each milestone against the M1 baseline. Prompts are synthetic random token
+ids — content does not affect compute — and decoding is greedy so sampling cost stays
+out of the measurement. `--kv-backend` selects the cache implementation; the paged
+backend's capacity is granted upfront so the timed region measures steady-state
+write/gather cost rather than allocator calls.
 
 Usage:
     uv run python benchmarks/benchmark_latency.py
+    uv run python benchmarks/benchmark_latency.py --kv-backend contiguous
     uv run python benchmarks/benchmark_latency.py --prompt-tokens 1024 --new-tokens 256
 """
 
@@ -18,7 +20,8 @@ import time
 import torch
 
 from tokamak import LLM
-from tokamak.model.kv_cache import KVCache
+from tokamak.memory import PagedKVCacheView
+from tokamak.model.kv_cache import ContiguousKVCache, KVCacheProtocol
 
 
 def synchronize(device: torch.device) -> None:
@@ -26,35 +29,43 @@ def synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def make_cache(llm: LLM, total_tokens: int) -> KVCacheProtocol:
+    if llm.kv_backend == "paged":
+        assert llm.paged_cache is not None and llm.block_manager is not None
+        view = PagedKVCacheView(llm.paged_cache, llm.block_manager, seq_id=0)
+        view.ensure_capacity(total_tokens)
+        return view
+    return ContiguousKVCache(
+        llm.model_config, max_seq_len=total_tokens, device=llm.device, dtype=llm.dtype
+    )
+
+
 @torch.inference_mode()
 def run_once(llm: LLM, prompt_ids: list[int], new_tokens: int) -> dict[str, float]:
     device = llm.device
-    cache = KVCache(
-        llm.model_config,
-        max_seq_len=len(prompt_ids) + new_tokens,
-        device=device,
-        dtype=llm.dtype,
-    )
-
-    # Prefill (greedy decoding throughout: sampling cost is not what we measure).
-    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-    synchronize(device)
-    start = time.perf_counter()
-    hidden = llm.model(input_ids, cache, start_pos=0)
-    token = int(llm.model.compute_logits(hidden[:, -1]).argmax().item())
-    synchronize(device)
-    prefill_s = time.perf_counter() - start
-
-    # Decode.
-    start = time.perf_counter()
-    pos = len(prompt_ids)
-    for _ in range(new_tokens):
-        step_ids = torch.tensor([[token]], dtype=torch.long, device=device)
-        hidden = llm.model(step_ids, cache, start_pos=pos)
+    cache = make_cache(llm, len(prompt_ids) + new_tokens)
+    try:
+        # Prefill.
+        input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+        synchronize(device)
+        start = time.perf_counter()
+        hidden = llm.model(input_ids, cache, start_pos=0)
         token = int(llm.model.compute_logits(hidden[:, -1]).argmax().item())
-        pos += 1
-    synchronize(device)
-    decode_s = time.perf_counter() - start
+        synchronize(device)
+        prefill_s = time.perf_counter() - start
+
+        # Decode.
+        start = time.perf_counter()
+        pos = len(prompt_ids)
+        for _ in range(new_tokens):
+            step_ids = torch.tensor([[token]], dtype=torch.long, device=device)
+            hidden = llm.model(step_ids, cache, start_pos=pos)
+            token = int(llm.model.compute_logits(hidden[:, -1]).argmax().item())
+            pos += 1
+        synchronize(device)
+        decode_s = time.perf_counter() - start
+    finally:
+        cache.release()
 
     return {
         "prefill_ms": prefill_s * 1000,
@@ -66,6 +77,8 @@ def run_once(llm: LLM, prompt_ids: list[int], new_tokens: int) -> dict[str, floa
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--kv-backend", choices=["contiguous", "paged"], default="paged")
+    parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--prompt-tokens", type=int, default=512)
     parser.add_argument("--new-tokens", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=1)
@@ -73,7 +86,13 @@ def main() -> None:
     parser.add_argument("--json", action="store_true", help="emit machine-readable output")
     args = parser.parse_args()
 
-    llm = LLM(args.model)
+    total_tokens = args.prompt_tokens + args.new_tokens
+    llm = LLM(
+        args.model,
+        max_seq_len=total_tokens,
+        kv_backend=args.kv_backend,
+        block_size=args.block_size,
+    )
     generator = torch.Generator().manual_seed(0)
     prompt_ids = torch.randint(
         0, llm.model_config.vocab_size, (args.prompt_tokens,), generator=generator
@@ -87,6 +106,8 @@ def main() -> None:
         "model": args.model,
         "device": str(llm.device),
         "dtype": str(llm.dtype),
+        "kv_backend": args.kv_backend,
+        "block_size": args.block_size if args.kv_backend == "paged" else None,
         "prompt_tokens": args.prompt_tokens,
         "new_tokens": args.new_tokens,
         "iters": args.iters,
@@ -104,6 +125,7 @@ def main() -> None:
         hardware = result.get("gpu", "cpu")
         print(f"\nmodel:             {result['model']}")
         print(f"device / dtype:    {result['device']} ({hardware}), {result['dtype']}")
+        print(f"kv backend:        {args.kv_backend}")
         print(f"workload:          {args.prompt_tokens} prompt + {args.new_tokens} new tokens")
         print(f"prefill (median):  {result['prefill_ms']:.1f} ms")
         print(

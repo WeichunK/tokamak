@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from tokamak.config import ModelConfig
-from tokamak.model.kv_cache import KVCache
+from tokamak.model.kv_cache import ContiguousKVCache
 from tokamak.model.transformer import TransformerForCausalLM
 
 
@@ -40,8 +40,8 @@ def make_model(config: ModelConfig, seed: int = 0) -> TransformerForCausalLM:
     return TransformerForCausalLM(config).eval()
 
 
-def make_cache(config: ModelConfig, max_seq_len: int = 64) -> KVCache:
-    return KVCache(
+def make_cache(config: ModelConfig, max_seq_len: int = 64) -> ContiguousKVCache:
+    return ContiguousKVCache(
         config,
         max_seq_len=max_seq_len,
         device=torch.device("cpu"),

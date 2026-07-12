@@ -17,7 +17,7 @@ from tokamak.model.layers import GatedMLP, RMSNorm, RotaryEmbedding, apply_rotar
 
 if TYPE_CHECKING:
     from tokamak.config import ModelConfig
-    from tokamak.model.kv_cache import KVCache
+    from tokamak.model.kv_cache import KVCacheProtocol
 
 
 class Attention(nn.Module):
@@ -52,7 +52,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        kv_cache: KVCache,
+        kv_cache: KVCacheProtocol,
         start_pos: int,
     ) -> torch.Tensor:
         """Attend over all cached positions up to and including the current tokens.
@@ -113,7 +113,7 @@ class DecoderLayer(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        kv_cache: KVCache,
+        kv_cache: KVCacheProtocol,
         start_pos: int,
     ) -> torch.Tensor:
         """Apply one decoder block with residual connections."""
@@ -137,7 +137,7 @@ class TransformerModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        kv_cache: KVCache,
+        kv_cache: KVCacheProtocol,
         start_pos: int,
     ) -> torch.Tensor:
         """Run the decoder stack, returning normalized hidden states."""
@@ -166,7 +166,7 @@ class TransformerForCausalLM(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        kv_cache: KVCache,
+        kv_cache: KVCacheProtocol,
         start_pos: int,
     ) -> torch.Tensor:
         """Return final hidden states of shape ``[batch, seq_len, hidden]``.

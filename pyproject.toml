@@ -8,8 +8,8 @@ version = "0.1.0.dev0"
 description = "A minimal LLM inference engine built from scratch in PyTorch: KV caching, paged attention, continuous batching, and speculative decoding."
 readme = "README.md"
 requires-python = ">=3.11"
-license = "MIT"
-license-files = ["LICENSE"]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Wei-Chun", email = "weijunintw@gmail.com" }]
 keywords = [
     "llm",

@@ -126,4 +126,6 @@ responsible for the final implementation and reported results.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache License 2.0 — see [LICENSE](LICENSE). Chosen over MIT for the explicit
+patent grant and license compatibility with the ecosystem this project draws on
+(vLLM, transformers).

@@ -33,7 +33,7 @@ Requires Python ≥ 3.11 and [uv](https://docs.astral.sh/uv/). A CUDA GPU is use
 when available; CPU works for small models.
 
 ```bash
-git clone https://github.com/<user>/tokamak.git
+git clone https://github.com/WeichunK/tokamak.git
 cd tokamak
 uv sync
 

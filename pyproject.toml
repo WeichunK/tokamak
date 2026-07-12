@@ -37,6 +37,10 @@ dependencies = [
     "tqdm>=4.66",
 ]
 
+[project.urls]
+Repository = "https://github.com/WeichunK/tokamak"
+Issues = "https://github.com/WeichunK/tokamak/issues"
+
 [dependency-groups]
 dev = [
     "ruff>=0.11",

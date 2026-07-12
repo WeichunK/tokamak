@@ -17,7 +17,7 @@ so CI stays CPU-only, GitHub Actions CI, pre-commit hooks.
 **Exit criteria:** CI is green on a clean checkout; `uv sync && uv run pytest` works
 on Windows and Linux.
 
-## M1 — Correct single-sequence engine 🚧
+## M1 — Correct single-sequence engine ✅
 
 A from-scratch decoder-only transformer (RMSNorm, RoPE, GQA, SwiGLU, optional QK-norm)
 covering the Llama / Qwen2 / Qwen3 families, loading safetensors checkpoints directly

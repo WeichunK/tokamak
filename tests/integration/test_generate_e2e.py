@@ -56,3 +56,48 @@ def test_oversized_prompt_raises(llm: LLM) -> None:
     long_prompt = "word " * (llm.max_seq_len + 1)
     with pytest.raises(ValueError, match="does not fit"):
         llm.generate(long_prompt, SamplingParams(max_new_tokens=1), use_tqdm=False)
+
+
+def test_outputs_carry_timing_metrics(llm: LLM) -> None:
+    outputs = llm.generate(
+        "Hello", SamplingParams(temperature=0.0, max_new_tokens=4), use_tqdm=False
+    )
+    assert outputs[0].ttft_s is not None and outputs[0].ttft_s > 0
+    assert outputs[0].latency_s is not None
+    assert outputs[0].latency_s >= outputs[0].ttft_s
+
+
+def test_preemption_preserves_greedy_output() -> None:
+    """Preemption-by-recomputation must be invisible in the generated tokens.
+
+    Two sequences that each need 2 KV blocks are run against a 3-block pool, so
+    whichever grows second is repeatedly evicted and re-prefilled mid-generation;
+    the outputs must match a run with a roomy pool.
+    """
+    prompts = ["The capital of France is", "1 + 1 ="]
+    params = SamplingParams(temperature=0.0, max_new_tokens=16, ignore_eos=True)
+
+    roomy = LLM(
+        MODEL_ID,
+        device="cpu",
+        dtype=torch.float32,
+        max_seq_len=32,
+        kv_pool_tokens=4096,
+        max_batch_size=2,
+        block_size=16,
+    )
+    expected = [o.output_token_ids for o in roomy.generate(prompts, params, use_tqdm=False)]
+    del roomy
+
+    tight = LLM(
+        MODEL_ID,
+        device="cpu",
+        dtype=torch.float32,
+        max_seq_len=32,
+        kv_pool_tokens=48,
+        max_batch_size=2,
+        block_size=16,
+    )
+    actual = [o.output_token_ids for o in tight.generate(prompts, params, use_tqdm=False)]
+
+    assert actual == expected

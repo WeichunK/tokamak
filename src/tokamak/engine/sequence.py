@@ -32,13 +32,19 @@ class FinishReason(enum.Enum):
 class Sequence:
     """Token-level state of one generation request.
 
+    A preempted sequence goes back to ``WAITING`` with its generated tokens
+    intact; resuming recomputes the KV cache over ``all_token_ids`` and continues.
+
     Attributes:
-        seq_id: Engine-assigned request id.
+        seq_id: Engine-assigned request id (also its FCFS arrival priority).
         prompt_token_ids: Tokenized prompt (immutable after construction).
         output_token_ids: Tokens generated so far, in order.
         sampling_params: Sampling configuration for this request.
         status: Current lifecycle status.
         finish_reason: Set exactly once, when the sequence finishes.
+        arrival_time: ``perf_counter`` timestamp when the request was submitted.
+        first_token_time: Timestamp of the first sampled token (TTFT numerator).
+        finish_time: Timestamp when the sequence finished.
     """
 
     def __init__(
@@ -55,6 +61,9 @@ class Sequence:
         self.sampling_params = sampling_params
         self.status = SequenceStatus.WAITING
         self.finish_reason: FinishReason | None = None
+        self.arrival_time: float | None = None
+        self.first_token_time: float | None = None
+        self.finish_time: float | None = None
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -70,6 +79,18 @@ class Sequence:
     def num_tokens(self) -> int:
         """Total tokens (prompt + generated)."""
         return self.num_prompt_tokens + self.num_output_tokens
+
+    @property
+    def all_token_ids(self) -> list[int]:
+        """Prompt plus generated tokens — what a (re)prefill computes over."""
+        return self.prompt_token_ids + self.output_token_ids
+
+    @property
+    def last_token_id(self) -> int:
+        """The most recent token (input to the next decode step)."""
+        if self.output_token_ids:
+            return self.output_token_ids[-1]
+        return self.prompt_token_ids[-1]
 
     @property
     def is_finished(self) -> bool:

@@ -20,6 +20,8 @@ class RequestOutput:
         output_text: Detokenized completion (special tokens stripped).
         output_token_ids: Generated token ids, including any final EOS.
         finish_reason: Why generation stopped.
+        ttft_s: Time from submission to the first sampled token (seconds).
+        latency_s: Time from submission to completion (seconds).
     """
 
     request_id: int
@@ -28,3 +30,5 @@ class RequestOutput:
     output_text: str
     output_token_ids: list[int]
     finish_reason: FinishReason
+    ttft_s: float | None = None
+    latency_s: float | None = None

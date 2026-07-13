@@ -1,7 +1,10 @@
-"""Per-step attention contexts: how one forward pass sees KV storage.
+"""Per-step attention contexts: each step's storage layout and attention math.
 
-The engine builds a context per step and the attention layers consume it, which is
-what lets one model implementation serve both phases of continuous batching:
+The engine builds a context per step; attention layers hand it rotated Q/K/V and
+receive attention outputs. Owning the whole (store → attend) pipeline is what
+makes contexts the kernel seam: the reference contexts here express attention
+through SDPA, and kernel-backed contexts (``tokamak.kernels``) replace both the
+storage traffic and the attention math without the model noticing.
 
 - :class:`PrefillContext` — one sequence writing positions ``[0, seq_len)``;
   square causal attention, exactly the M1 code path.
@@ -21,6 +24,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 
 if TYPE_CHECKING:
     from collections.abc import Sequence as AbcSequence
@@ -31,21 +35,19 @@ if TYPE_CHECKING:
 class StepContextProtocol(Protocol):
     """What attention layers require from a step context."""
 
-    def update(
-        self, layer_idx: int, k: torch.Tensor, v: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Store this step's keys/values and return what attention should see.
+    def attend(
+        self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        """Store this step's K/V and attend over everything each row may see.
 
         Args:
             layer_idx: Decoder layer index.
-            k: New keys of shape ``[batch, num_kv_heads, seq_len, head_dim]``.
-            v: New values, same shape as ``k``.
+            q: Rotated queries of shape ``[batch, num_q_heads, seq_len, head_dim]``.
+            k: Rotated keys of shape ``[batch, num_kv_heads, seq_len, head_dim]``.
+            v: Values, same shape as ``k``.
 
         Returns:
-            ``(k_all, v_all, attn_mask)``. When ``attn_mask`` is ``None`` the
-            attention matrix is square and causal masking applies; otherwise it
-            is a boolean mask (``True`` = attend) broadcastable to
-            ``[batch, heads, q_len, kv_len]``.
+            Attention output of shape ``[batch, num_q_heads, seq_len, head_dim]``.
         """
         ...
 
@@ -56,12 +58,18 @@ class PrefillContext:
     def __init__(self, cache: KVCacheProtocol) -> None:
         self._cache = cache
 
-    def update(
-        self, layer_idx: int, k: torch.Tensor, v: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Write the full prompt; attention over it is square and causal."""
+    def attend(
+        self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        """Write the full prompt, then run square causal attention over it.
+
+        SDPA's ``is_causal`` aligns the mask to the top-left corner, which is
+        correct exactly because prefill queries and keys have equal length.
+        """
         k_all, v_all = self._cache.update(layer_idx, k, v, start_pos=0)
-        return k_all, v_all, None
+        return F.scaled_dot_product_attention(
+            q, k_all, v_all, is_causal=q.shape[2] > 1, enable_gqa=True
+        )
 
 
 class BatchedDecodeContext:
@@ -90,10 +98,14 @@ class BatchedDecodeContext:
         # [batch, 1, 1, max_len]: True where the column is a real position.
         self.attn_mask = (cols[None, :] < lens[:, None])[:, None, None, :]
 
-    def update(
-        self, layer_idx: int, k: torch.Tensor, v: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Write each row's token at its own position; gather padded histories."""
+    def attend(
+        self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        """Write each row's token, gather padded histories, mask, and attend.
+
+        Causality is implied — only past positions exist in each row's cache —
+        so the only mask needed is the padding-length mask.
+        """
         batch, num_kv_heads, seq_len, head_dim = k.shape
         if seq_len != 1:
             raise ValueError(f"decode steps carry exactly 1 token per row, got {seq_len}")
@@ -107,4 +119,6 @@ class BatchedDecodeContext:
             k_i, v_i = cache.update(layer_idx, k[i : i + 1], v[i : i + 1], start_pos=length - 1)
             k_pad[i, :, :length] = k_i[0]
             v_pad[i, :, :length] = v_i[0]
-        return k_pad, v_pad, self.attn_mask
+        return F.scaled_dot_product_attention(
+            q, k_pad, v_pad, attn_mask=self.attn_mask, enable_gqa=True
+        )

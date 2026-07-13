@@ -10,7 +10,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F  # noqa: N812
 from torch import nn
 
 from tokamak.model.layers import GatedMLP, RMSNorm, RotaryEmbedding, apply_rotary_emb
@@ -78,17 +77,9 @@ class Attention(nn.Module):
         v = v.transpose(1, 2)
         q, k = apply_rotary_emb(q, k, cos, sin)
 
-        k, v, attn_mask = ctx.update(self.layer_idx, k, v)
-
-        # Prefill (mask is None): square attention matrix, causal masking via
-        # SDPA's is_causal — correct exactly because q and k have equal length.
-        # Batched decode: one query per row attending over its padded history,
-        # with the context's length mask; causality is implied since only past
-        # positions exist in the cache.
-        is_causal = attn_mask is None and seq_len > 1
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=is_causal, enable_gqa=True
-        )
+        # The context owns storage and attention math (SDPA reference or a
+        # fused kernel); this layer only projects.
+        out = ctx.attend(self.layer_idx, q, k, v)
 
         out = out.transpose(1, 2).reshape(batch_size, seq_len, -1)
         projected: torch.Tensor = self.o_proj(out)

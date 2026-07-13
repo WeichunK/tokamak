@@ -14,6 +14,7 @@ import torch
 from tokamak import LLM, SamplingParams
 from tokamak.memory import PagedKVCacheView
 from tokamak.model.kv_cache import ContiguousKVCache, KVCacheProtocol
+from tokamak.model.step_context import PrefillContext
 
 MODEL_ID = "Qwen/Qwen3-0.6B"
 PROMPT = "The capital of France is"
@@ -58,8 +59,11 @@ def test_prefill_logits_match_hf(tokamak_llm: LLM, hf_model) -> None:  # type: i
     input_ids = torch.tensor([token_ids], dtype=torch.long)
 
     cache = make_cache(tokamak_llm, len(token_ids))
+    positions = torch.arange(len(token_ids))[None]
     try:
-        ours = tokamak_llm.model.compute_logits(tokamak_llm.model(input_ids, cache, start_pos=0))
+        ours = tokamak_llm.model.compute_logits(
+            tokamak_llm.model(input_ids, positions, PrefillContext(cache))
+        )
     finally:
         cache.release()
     theirs = hf_model(input_ids).logits.float()

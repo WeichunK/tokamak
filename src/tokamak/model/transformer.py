@@ -17,7 +17,7 @@ from tokamak.model.layers import GatedMLP, RMSNorm, RotaryEmbedding, apply_rotar
 
 if TYPE_CHECKING:
     from tokamak.config import ModelConfig
-    from tokamak.model.kv_cache import KVCacheProtocol
+    from tokamak.model.step_context import StepContextProtocol
 
 
 class Attention(nn.Module):
@@ -52,17 +52,16 @@ class Attention(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        kv_cache: KVCacheProtocol,
-        start_pos: int,
+        ctx: StepContextProtocol,
     ) -> torch.Tensor:
-        """Attend over all cached positions up to and including the current tokens.
+        """Attend over every cached position visible to each row.
 
         Args:
             x: Input activations of shape ``[batch, seq_len, hidden]``.
             cos: RoPE cosine table for the current positions.
             sin: RoPE sine table for the current positions.
-            kv_cache: Cache holding keys/values for positions ``[0, start_pos)``.
-            start_pos: Absolute position of ``x[:, 0]``.
+            ctx: Step context that stores this step's K/V and returns what each
+                row may attend over (plus a padding mask for batched decode).
         """
         batch_size, seq_len, _ = x.shape
 
@@ -79,19 +78,17 @@ class Attention(nn.Module):
         v = v.transpose(1, 2)
         q, k = apply_rotary_emb(q, k, cos, sin)
 
-        k, v = kv_cache.update(self.layer_idx, k, v, start_pos)
+        k, v, attn_mask = ctx.update(self.layer_idx, k, v)
 
-        # Two cases cover the M1 engine: full prefill (causal mask over a square
-        # attention matrix) and single-token decode (the new token may attend to
-        # everything cached, so no mask is needed). SDPA's `is_causal` aligns the
-        # mask to the top-left corner, which is only correct when q and k have equal
-        # length — guard against silently reusing it for chunked inputs.
-        if seq_len > 1 and start_pos != 0:
-            raise NotImplementedError(
-                "chunked prefill is not supported: multi-token forward passes must "
-                "start at position 0"
-            )
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=seq_len > 1, enable_gqa=True)
+        # Prefill (mask is None): square attention matrix, causal masking via
+        # SDPA's is_causal — correct exactly because q and k have equal length.
+        # Batched decode: one query per row attending over its padded history,
+        # with the context's length mask; causality is implied since only past
+        # positions exist in the cache.
+        is_causal = attn_mask is None and seq_len > 1
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, is_causal=is_causal, enable_gqa=True
+        )
 
         out = out.transpose(1, 2).reshape(batch_size, seq_len, -1)
         projected: torch.Tensor = self.o_proj(out)
@@ -113,11 +110,10 @@ class DecoderLayer(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        kv_cache: KVCacheProtocol,
-        start_pos: int,
+        ctx: StepContextProtocol,
     ) -> torch.Tensor:
         """Apply one decoder block with residual connections."""
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin, kv_cache, start_pos)
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, ctx)
         out: torch.Tensor = x + self.mlp(self.post_attention_layernorm(x))
         return out
 
@@ -137,17 +133,22 @@ class TransformerModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        kv_cache: KVCacheProtocol,
-        start_pos: int,
+        positions: torch.Tensor,
+        ctx: StepContextProtocol,
     ) -> torch.Tensor:
-        """Run the decoder stack, returning normalized hidden states."""
-        seq_len = input_ids.shape[1]
-        positions = torch.arange(start_pos, start_pos + seq_len, device=input_ids.device)
+        """Run the decoder stack, returning normalized hidden states.
+
+        Args:
+            input_ids: Token ids of shape ``[batch, seq_len]``.
+            positions: Absolute position of every input token, ``[batch, seq_len]``
+                (rows may sit at different positions during batched decode).
+            ctx: Step context shared by all layers.
+        """
         cos, sin = self.rotary_emb(positions)
 
         x = self.embed_tokens(input_ids)
         for layer in self.layers:
-            x = layer(x, cos, sin, kv_cache, start_pos)
+            x = layer(x, cos, sin, ctx)
         normalized: torch.Tensor = self.norm(x)
         return normalized
 
@@ -166,8 +167,8 @@ class TransformerForCausalLM(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        kv_cache: KVCacheProtocol,
-        start_pos: int,
+        positions: torch.Tensor,
+        ctx: StepContextProtocol,
     ) -> torch.Tensor:
         """Return final hidden states of shape ``[batch, seq_len, hidden]``.
 
@@ -175,7 +176,7 @@ class TransformerForCausalLM(nn.Module):
         project only the last position during generation instead of the full
         ``[batch, seq_len, vocab]`` tensor.
         """
-        hidden: torch.Tensor = self.model(input_ids, kv_cache, start_pos)
+        hidden: torch.Tensor = self.model(input_ids, positions, ctx)
         return hidden
 
     def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:

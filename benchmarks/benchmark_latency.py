@@ -22,6 +22,7 @@ import torch
 from tokamak import LLM
 from tokamak.memory import PagedKVCacheView
 from tokamak.model.kv_cache import ContiguousKVCache, KVCacheProtocol
+from tokamak.model.step_context import BatchedDecodeContext, PrefillContext
 
 
 def synchronize(device: torch.device) -> None:
@@ -47,9 +48,10 @@ def run_once(llm: LLM, prompt_ids: list[int], new_tokens: int) -> dict[str, floa
     try:
         # Prefill.
         input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+        positions = torch.arange(len(prompt_ids), device=device)[None]
         synchronize(device)
         start = time.perf_counter()
-        hidden = llm.model(input_ids, cache, start_pos=0)
+        hidden = llm.model(input_ids, positions, PrefillContext(cache))
         token = int(llm.model.compute_logits(hidden[:, -1]).argmax().item())
         synchronize(device)
         prefill_s = time.perf_counter() - start
@@ -59,7 +61,9 @@ def run_once(llm: LLM, prompt_ids: list[int], new_tokens: int) -> dict[str, floa
         pos = len(prompt_ids)
         for _ in range(new_tokens):
             step_ids = torch.tensor([[token]], dtype=torch.long, device=device)
-            hidden = llm.model(step_ids, cache, start_pos=pos)
+            step_pos = torch.tensor([[pos]], dtype=torch.long, device=device)
+            ctx = BatchedDecodeContext([cache], [pos + 1], device)
+            hidden = llm.model(step_ids, step_pos, ctx)
             token = int(llm.model.compute_logits(hidden[:, -1]).argmax().item())
             pos += 1
         synchronize(device)

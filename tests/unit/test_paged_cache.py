@@ -7,6 +7,7 @@ import torch
 from tokamak.config import ModelConfig
 from tokamak.memory import BlockManager, OutOfBlocksError, PagedKVCache, PagedKVCacheView
 from tokamak.model.kv_cache import ContiguousKVCache
+from tokamak.model.step_context import BatchedDecodeContext, PrefillContext
 from tokamak.model.transformer import TransformerForCausalLM
 
 CPU = torch.device("cpu")
@@ -124,11 +125,12 @@ def test_paged_matches_contiguous_on_tiny_model() -> None:
     logits: dict[str, list[torch.Tensor]] = {"contiguous": [], "paged": []}
     for name, cache in (("contiguous", contiguous), ("paged", paged)):
         cache.ensure_capacity(6)
-        hidden = model(token_ids[:, :6], cache, start_pos=0)
+        hidden = model(token_ids[:, :6], torch.arange(6)[None], PrefillContext(cache))
         logits[name].append(model.compute_logits(hidden))
         for pos in range(6, 13):  # decode crosses block boundaries at 8 and 12
             cache.ensure_capacity(pos + 1)
-            hidden = model(token_ids[:, pos : pos + 1], cache, start_pos=pos)
+            ctx = BatchedDecodeContext([cache], [pos + 1], CPU)
+            hidden = model(token_ids[:, pos : pos + 1], torch.tensor([[pos]]), ctx)
             logits[name].append(model.compute_logits(hidden))
 
     torch.testing.assert_close(
@@ -157,8 +159,9 @@ def test_paged_matches_contiguous_with_fragmented_pool() -> None:
     assert manager.block_table(0) != sorted(manager.block_table(0))
 
     contiguous = ContiguousKVCache(config, max_seq_len=12, device=CPU, dtype=torch.float32)
-    hidden_paged = model(token_ids, view, start_pos=0)
-    hidden_contig = model(token_ids, contiguous, start_pos=0)
+    positions = torch.arange(12)[None]
+    hidden_paged = model(token_ids, positions, PrefillContext(view))
+    hidden_contig = model(token_ids, positions, PrefillContext(contiguous))
 
     torch.testing.assert_close(
         model.compute_logits(hidden_paged), model.compute_logits(hidden_contig)

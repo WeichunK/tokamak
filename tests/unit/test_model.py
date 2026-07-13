@@ -1,8 +1,12 @@
 """Model-level correctness tests on tiny random-weight configurations.
 
-The key invariant: decoding token-by-token through the KV cache must produce the
-same logits as one full forward pass over the whole sequence. This exercises cache
-indexing, causal masking, GQA, and RoPE position handling without any checkpoint.
+Two invariants anchor everything:
+
+1. Decoding token-by-token through the KV cache must produce the same logits as
+   one full forward pass (cache indexing, causal masking, GQA, RoPE positions).
+2. Decoding sequences batched together must produce the same logits as decoding
+   them one at a time (padding, masks, per-row positions) — the invariant that
+   makes continuous batching safe.
 """
 
 import pytest
@@ -10,7 +14,10 @@ import torch
 
 from tokamak.config import ModelConfig
 from tokamak.model.kv_cache import ContiguousKVCache
+from tokamak.model.step_context import BatchedDecodeContext, PrefillContext
 from tokamak.model.transformer import TransformerForCausalLM
+
+CPU = torch.device("cpu")
 
 
 def tiny_config(**overrides: object) -> ModelConfig:
@@ -41,12 +48,27 @@ def make_model(config: ModelConfig, seed: int = 0) -> TransformerForCausalLM:
 
 
 def make_cache(config: ModelConfig, max_seq_len: int = 64) -> ContiguousKVCache:
-    return ContiguousKVCache(
-        config,
-        max_seq_len=max_seq_len,
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-    )
+    return ContiguousKVCache(config, max_seq_len=max_seq_len, device=CPU, dtype=torch.float32)
+
+
+def full_forward_logits(
+    model: TransformerForCausalLM, config: ModelConfig, token_ids: torch.Tensor
+) -> torch.Tensor:
+    positions = torch.arange(token_ids.shape[1])[None]
+    hidden = model(token_ids, positions, PrefillContext(make_cache(config)))
+    return model.compute_logits(hidden)
+
+
+def decode_one(
+    model: TransformerForCausalLM,
+    cache: ContiguousKVCache,
+    token: torch.Tensor,
+    position: int,
+) -> torch.Tensor:
+    """One single-sequence decode step; returns [1, 1, vocab] logits."""
+    ctx = BatchedDecodeContext([cache], [position + 1], CPU)
+    hidden = model(token.view(1, 1), torch.tensor([[position]]), ctx)
+    return model.compute_logits(hidden)
 
 
 @pytest.mark.parametrize(
@@ -72,21 +94,59 @@ def test_incremental_decode_matches_full_forward(config: ModelConfig) -> None:
     generator = torch.Generator().manual_seed(1)
     token_ids = torch.randint(0, config.vocab_size, (1, 12), generator=generator)
 
-    # One pass over the full sequence.
-    full_hidden = model(token_ids, make_cache(config), start_pos=0)
-    full_logits = model.compute_logits(full_hidden)
+    full_logits = full_forward_logits(model, config, token_ids)
 
     # Prefill the first 5 tokens, then decode the rest one token at a time.
     cache = make_cache(config)
-    step_logits = []
-    hidden = model(token_ids[:, :5], cache, start_pos=0)
-    step_logits.append(model.compute_logits(hidden))
+    positions = torch.arange(5)[None]
+    hidden = model(token_ids[:, :5], positions, PrefillContext(cache))
+    step_logits = [model.compute_logits(hidden)]
     for pos in range(5, 12):
-        hidden = model(token_ids[:, pos : pos + 1], cache, start_pos=pos)
-        step_logits.append(model.compute_logits(hidden))
+        step_logits.append(decode_one(model, cache, token_ids[:, pos], pos))
 
-    incremental_logits = torch.cat(step_logits, dim=1)
-    torch.testing.assert_close(incremental_logits, full_logits, rtol=1e-4, atol=1e-4)
+    incremental = torch.cat(step_logits, dim=1)
+    torch.testing.assert_close(incremental, full_logits, rtol=1e-4, atol=1e-4)
+
+
+@torch.inference_mode()
+def test_batched_decode_matches_sequential() -> None:
+    """The continuous-batching invariant: batching must not change any row's logits."""
+    config = tiny_config()
+    model = make_model(config)
+    generator = torch.Generator().manual_seed(4)
+    prompts = [torch.randint(0, config.vocab_size, (1, n), generator=generator) for n in (5, 9)]
+    steps = 4
+
+    # Sequential reference: each sequence decodes alone.
+    sequential_logits: list[list[torch.Tensor]] = []
+    seq_caches = []
+    for prompt in prompts:
+        cache = make_cache(config)
+        model(prompt, torch.arange(prompt.shape[1])[None], PrefillContext(cache))
+        seq_caches.append(cache)
+        per_seq = []
+        for step in range(steps):
+            pos = prompt.shape[1] + step
+            token = torch.tensor([step + 1])
+            per_seq.append(decode_one(model, cache, token, pos))
+        sequential_logits.append(per_seq)
+
+    # Batched: same prompts prefilled separately, then decoded together.
+    batch_caches = []
+    for prompt in prompts:
+        cache = make_cache(config)
+        model(prompt, torch.arange(prompt.shape[1])[None], PrefillContext(cache))
+        batch_caches.append(cache)
+
+    for step in range(steps):
+        lens = [prompt.shape[1] + step + 1 for prompt in prompts]
+        ctx = BatchedDecodeContext(batch_caches, lens, CPU)
+        input_ids = torch.tensor([[step + 1], [step + 1]])
+        positions = torch.tensor([[lens[0] - 1], [lens[1] - 1]])
+        hidden = model(input_ids, positions, ctx)
+        logits = model.compute_logits(hidden)
+        for row, per_seq in enumerate(sequential_logits):
+            torch.testing.assert_close(logits[row : row + 1], per_seq[step], rtol=1e-4, atol=1e-4)
 
 
 @torch.inference_mode()
@@ -99,8 +159,8 @@ def test_logits_causality() -> None:
     tokens_b = tokens_a.clone()
     tokens_b[0, -1] = (tokens_b[0, -1] + 1) % config.vocab_size
 
-    logits_a = model.compute_logits(model(tokens_a, make_cache(config), start_pos=0))
-    logits_b = model.compute_logits(model(tokens_b, make_cache(config), start_pos=0))
+    logits_a = full_forward_logits(model, config, tokens_a)
+    logits_b = full_forward_logits(model, config, tokens_b)
 
     torch.testing.assert_close(logits_a[:, :-1], logits_b[:, :-1])
     assert not torch.allclose(logits_a[:, -1], logits_b[:, -1])
@@ -118,12 +178,4 @@ def test_kv_cache_overflow_raises() -> None:
     cache = make_cache(config, max_seq_len=4)
     tokens = torch.randint(0, config.vocab_size, (1, 5))
     with pytest.raises(ValueError, match="KV cache overflow"):
-        model(tokens, cache, start_pos=0)
-
-
-def test_chunked_prefill_rejected() -> None:
-    config = tiny_config()
-    model = make_model(config)
-    tokens = torch.randint(0, config.vocab_size, (1, 4))
-    with pytest.raises(NotImplementedError, match="chunked prefill"):
-        model(tokens, make_cache(config), start_pos=2)
+        model(tokens, torch.arange(5)[None], PrefillContext(cache))

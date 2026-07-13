@@ -54,6 +54,46 @@ uv run python benchmarks/benchmark_latency.py --kv-backend contiguous
 uv run python benchmarks/benchmark_kv_memory.py
 ```
 
+## Throughput under concurrency (`benchmark_throughput.py`)
+
+The M3 exit-criteria curve. Fixed seeded workload replayed identically for every
+configuration: 32 chat-like requests (log-normal prompts, 4,915 prompt tokens
+total; exponential generation lengths, 2,901 output tokens total), greedy
+decoding, EOS ignored, paged KV backend with a 16,384-token pool.
+
+"Sequential" is continuous batching at `max_batch_size=1` (the M1/M2 behaviour).
+"Static" fills a batch and drains it before admitting more — modelled charitably
+(finished sequences stop consuming compute, which padded implementations don't
+get), so the continuous-batching win below is a lower bound.
+
+| Config | Wall (s) | Out tok/s | Req/min | TTFT mean (s) | TTFT p95 (s) | Latency mean (s) | Latency p95 (s) |
+|---|---|---|---|---|---|---|---|
+| sequential | 187.9 | 15.4 | 10.2 | 106.4 | 179.7 | 112.2 | 185.7 |
+| static b=4 | 106.9 | 27.1 | 18.0 | 55.8 | 100.5 | 62.8 | 103.3 |
+| continuous b=4 | 69.0 | 42.0 | 27.8 | 32.6 | 61.7 | 40.9 | 67.2 |
+| static b=16 | 57.2 | 50.7 | 33.6 | 16.9 | 33.7 | 30.5 | 48.7 |
+| continuous b=16 | 44.9 | 64.6 | 42.7 | 7.4 | 23.4 | 24.4 | 42.8 |
+
+Reading the curve:
+
+- **Throughput scales with concurrency** (the M3 exit criterion): 15.4 → 42.0 →
+  64.6 tok/s as the batch goes 1 → 4 → 16. Decode is bandwidth- and launch-bound,
+  so extra rows through the same weights are nearly free until compute saturates.
+- **Continuous beats static at every batch size** — 1.55× at b=4, 1.27× at b=16 —
+  purely from keeping seats filled: finished requests are replaced at token
+  granularity instead of waiting for the batch to drain. The static baseline here
+  is charitable; against a real padded implementation the gap widens.
+- **TTFT is where iteration-level admission dominates**: mean 7.4 s vs 16.9 s
+  (static, b=16) vs 106.4 s (sequential). Prefill-priority admission starts new
+  requests the moment blocks free up.
+- Continuous batching does not make a *single* request faster — sequential mode
+  matches the M2 single-sequence numbers. It makes the fleet share hardware that
+  one request cannot saturate.
+
+```bash
+uv run python benchmarks/benchmark_throughput.py
+```
+
 Reproduce with:
 
 ```bash

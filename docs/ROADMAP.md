@@ -58,14 +58,19 @@ sequential and static batching); preemption by recomputation is provably invisib
 in greedy outputs (tested against a 3-block pool on real weights). Design notes:
 [design/003-continuous-batching.md](design/003-continuous-batching.md).
 
-## M4 — Custom attention kernels ⬜
+## M4 — Custom attention kernels ✅
 
 A Triton paged-attention decode kernel to replace the PyTorch reference
 implementation, plus a benchmark harness comparing both against
 `torch.nn.functional.scaled_dot_product_attention` on contiguous inputs.
 
-**Exit criteria:** kernel passes the same equivalence tests as the reference paged
-implementation; kernel-level microbenchmarks are recorded.
+**Exit criteria (met):** the kernel passes the reference equivalence suite
+(fp64 explicit-math comparison over scattered tables, both dtypes, 4k-token
+online-softmax stability; engine-level greedy token-identical to the SDPA path)
+and microbenchmarks are recorded: 4.0–32.7× over the reference gather path,
+faster than no-gather eager SDPA at every measured shape, single-sequence decode
+21.0 tok/s vs the 15.8 reference / 19.0 contiguous baselines. Design notes:
+[design/004-triton-paged-attention.md](design/004-triton-paged-attention.md).
 
 ## M5 — Speculative decoding ⬜
 

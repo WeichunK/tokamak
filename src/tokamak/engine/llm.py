@@ -26,6 +26,7 @@ import torch
 from tqdm.auto import tqdm
 from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 
+from tokamak import kernels
 from tokamak.config import ModelConfig, resolve_device, resolve_dtype
 from tokamak.engine.outputs import RequestOutput
 from tokamak.engine.scheduler import ScheduledBatch, Scheduler, StepKind
@@ -33,7 +34,11 @@ from tokamak.engine.sequence import FinishReason, Sequence
 from tokamak.memory import BlockManager, PagedKVCache, PagedKVCacheView
 from tokamak.model.kv_cache import ContiguousKVCache, KVCacheProtocol
 from tokamak.model.loader import build_model, load_weights, resolve_model_path
-from tokamak.model.step_context import BatchedDecodeContext, PrefillContext
+from tokamak.model.step_context import (
+    BatchedDecodeContext,
+    PrefillContext,
+    StepContextProtocol,
+)
 from tokamak.sampling.sampler import sample
 from tokamak.sampling_params import SamplingParams
 
@@ -75,6 +80,11 @@ class LLM:
         scheduling: ``"continuous"`` (default) admits requests the moment a slot
             and blocks are free; ``"static"`` fills a batch and lets it drain
             before admitting again (the comparison baseline for benchmarks).
+        attention_backend: ``"sdpa"`` is the reference decode path (gather +
+            padded SDPA); ``"triton"`` decodes through the paged-attention
+            kernel, reading block tables in place (requires the ``triton``
+            extra, CUDA, and the paged KV backend). ``"auto"`` (default) picks
+            the kernel when available. Prefill always uses SDPA.
     """
 
     def __init__(
@@ -89,6 +99,7 @@ class LLM:
         kv_pool_tokens: int | None = None,
         max_batch_size: int = 16,
         scheduling: Literal["continuous", "static"] = "continuous",
+        attention_backend: Literal["auto", "sdpa", "triton"] = "auto",
     ) -> None:
         if kv_backend not in ("contiguous", "paged"):
             raise ValueError(f"Unknown kv_backend: {kv_backend!r}")
@@ -131,21 +142,42 @@ class LLM:
                 dtype=self.dtype,
             )
 
+        self.attention_backend = self._resolve_attention_backend(attention_backend)
+
         # Per-generate() run state (single-threaded engine).
         self._caches: dict[int, KVCacheProtocol] = {}
         self._generators: dict[int, torch.Generator] = {}
 
         logger.info(
-            "Loading %s (%s) on %s as %s (kv_backend=%s, scheduling=%s)",
+            "Loading %s (%s) on %s as %s (kv_backend=%s, scheduling=%s, attention=%s)",
             model,
             self.model_config.architecture,
             self.device,
             self.dtype,
             kv_backend,
             scheduling,
+            self.attention_backend,
         )
         self.model = build_model(self.model_config, self.device, self.dtype)
         load_weights(self.model, model_path)
+
+    def _resolve_attention_backend(
+        self, requested: Literal["auto", "sdpa", "triton"]
+    ) -> Literal["sdpa", "triton"]:
+        """Pick the decode attention path, validating explicit requests loudly."""
+        if requested == "sdpa":
+            return "sdpa"
+        available = (
+            self.kv_backend == "paged" and self.device.type == "cuda" and kernels.is_available()
+        )
+        if requested == "triton":
+            if not available:
+                raise ValueError(
+                    "attention_backend='triton' requires the paged KV backend, a CUDA "
+                    "device, and the triton extra (pip install 'tokamak-llm[triton]')"
+                )
+            return "triton"
+        return "triton" if available else "sdpa"
 
     def _resolve_eos_ids(self, model_path: Path) -> tuple[int, ...]:
         """Resolve EOS ids from the generation config, falling back to the tokenizer.
@@ -268,11 +300,37 @@ class LLM:
         positions = torch.tensor(
             [[seq.num_tokens - 1] for seq in seqs], dtype=torch.long, device=self.device
         )
-        ctx = BatchedDecodeContext(caches, [seq.num_tokens for seq in seqs], self.device)
+        if self.attention_backend == "triton":
+            ctx: StepContextProtocol = self._triton_decode_context(seqs)
+        else:
+            ctx = BatchedDecodeContext(caches, [seq.num_tokens for seq in seqs], self.device)
         hidden = self.model(input_ids, positions, ctx)
         logits = self.model.compute_logits(hidden[:, -1])
         for i, seq in enumerate(seqs):
             self._append_sampled(seq, logits[i : i + 1])
+
+    def _triton_decode_context(self, seqs: list[Sequence]) -> StepContextProtocol:
+        """Build block-table / slot tensors for the kernel-backed decode step."""
+        from tokamak.kernels.paged_attention import TritonPagedDecodeContext
+
+        assert self.block_manager is not None and self.paged_cache is not None
+        block_size = self.block_manager.block_size
+        tables = [self.block_manager.block_table(seq.seq_id) for seq in seqs]
+        seq_lens = [seq.num_tokens for seq in seqs]
+
+        max_blocks = max(len(table) for table in tables)
+        block_tables = torch.zeros(len(seqs), max_blocks, dtype=torch.int32)
+        slots = torch.empty(len(seqs), dtype=torch.int64)
+        for i, (table, length) in enumerate(zip(tables, seq_lens, strict=True)):
+            block_tables[i, : len(table)] = torch.tensor(table, dtype=torch.int32)
+            position = length - 1
+            slots[i] = table[position // block_size] * block_size + position % block_size
+        return TritonPagedDecodeContext(
+            self.paged_cache,
+            block_tables.to(self.device),
+            torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
+            slots.to(self.device),
+        )
 
     def _append_sampled(self, seq: Sequence, logits: torch.Tensor) -> None:
         """Sample one token for ``seq``, append it, and apply stop conditions."""

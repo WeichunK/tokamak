@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from tokamak import LLM, SamplingParams
+from tokamak import LLM, SamplingParams, kernels
 from tokamak.engine.sequence import FinishReason
 
 MODEL_ID = "Qwen/Qwen3-0.6B"
@@ -65,6 +65,25 @@ def test_outputs_carry_timing_metrics(llm: LLM) -> None:
     assert outputs[0].ttft_s is not None and outputs[0].ttft_s > 0
     assert outputs[0].latency_s is not None
     assert outputs[0].latency_s >= outputs[0].ttft_s
+
+
+@pytest.mark.gpu
+def test_triton_backend_matches_sdpa_greedy() -> None:
+    """The kernel decode path must reproduce the reference path token for token."""
+    if not kernels.is_available():
+        pytest.skip("CUDA + triton required")
+    prompts = ["The capital of France is", "1 + 1 ="]
+    params = SamplingParams(temperature=0.0, max_new_tokens=16, ignore_eos=True)
+
+    reference = LLM(MODEL_ID, max_seq_len=512, attention_backend="sdpa")
+    expected = [o.output_token_ids for o in reference.generate(prompts, params, use_tqdm=False)]
+    del reference
+    torch.cuda.empty_cache()
+
+    kernel = LLM(MODEL_ID, max_seq_len=512, attention_backend="triton")
+    actual = [o.output_token_ids for o in kernel.generate(prompts, params, use_tqdm=False)]
+
+    assert actual == expected
 
 
 def test_preemption_preserves_greedy_output() -> None:

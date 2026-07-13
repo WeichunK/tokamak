@@ -45,15 +45,18 @@ weights for both backends); measured reservation waste drops from 50.1% to 2.0%
 single-sequence — the recorded motivation for M4. Design notes:
 [design/002-paged-kv-cache.md](design/002-paged-kv-cache.md).
 
-## M3 — Continuous batching ⬜
+## M3 — Continuous batching ✅
 
 An iteration-level scheduler (in the style of Orca): requests join and leave the
 running batch at every engine step instead of waiting for the batch to drain.
 Separate prefill and decode phases, FCFS admission with preemption when KV blocks
 run out.
 
-**Exit criteria:** throughput scales with concurrent requests; a throughput/latency
-curve vs. static batching is recorded.
+**Exit criteria (met):** throughput scales with concurrent requests (see
+[benchmarks/README.md](../benchmarks/README.md) for the recorded curve vs.
+sequential and static batching); preemption by recomputation is provably invisible
+in greedy outputs (tested against a 3-block pool on real weights). Design notes:
+[design/003-continuous-batching.md](design/003-continuous-batching.md).
 
 ## M4 — Custom attention kernels ⬜
 

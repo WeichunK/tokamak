@@ -18,7 +18,7 @@ every milestone: **prove it correct, then measure what it buys.**
 |---|---|---|
 | M1 | Single-sequence engine: from-scratch decoder, contiguous KV cache, sampling | ✅ |
 | M2 | Paged KV cache (block manager + paged attention) | ✅ |
-| M3 | Continuous batching (iteration-level scheduling) | ⬜ |
+| M3 | Continuous batching (iteration-level scheduling) | ✅ |
 | M4 | Custom Triton attention kernels | ⬜ |
 | M5 | Speculative decoding (draft + rejection sampling) | ⬜ |
 | M6 | Benchmark & gap analysis vs. vLLM | ⬜ |
@@ -70,10 +70,14 @@ src/tokamak/
 │   └── paged_cache.py    # paged storage + gather-based reference paged attention
 ├── sampling/sampler.py   # temperature → top-k → top-p → multinomial
 └── engine/
-    ├── llm.py            # offline LLM API: prefill + token-by-token decode
+    ├── llm.py            # offline LLM API driving the scheduler step loop
+    ├── scheduler.py      # iteration-level FCFS scheduling + preemption (Orca-style)
     ├── sequence.py       # request state machine
-    └── outputs.py        # RequestOutput
+    └── outputs.py        # RequestOutput (+ TTFT / latency metrics)
 ```
+
+(`model/step_context.py` holds the prefill/batched-decode contexts that let one
+model implementation serve both phases of continuous batching.)
 
 The model code is written from scratch (no `transformers` modules at runtime);
 `transformers` is used only for tokenization and config parsing, which is the same
@@ -95,8 +99,11 @@ decode — deliberately unimpressive, and the whole point: each following milest
 has to earn its complexity against these numbers. M2's paged cache cuts KV
 reservation waste from 50.1% to 2.0% on a simulated chat workload, at a measured
 (and deliberate) 17% single-sequence decode cost for the reference gather that the
-M4 kernel exists to remove. The M6 comparison against vLLM (same model, same
-traces, same GPU) comes with an honest analysis of the gap and where it comes from.
+M4 kernel exists to remove. M3's continuous batching turns that reclaimed memory
+into throughput: 4.2× tokens/s and 14× better mean TTFT over sequential serving
+on a 32-request workload, beating (charitably modelled) static batching at every
+batch size. The M6 comparison against vLLM (same model, same traces, same GPU)
+comes with an honest analysis of the gap and where it comes from.
 
 ## Development
 

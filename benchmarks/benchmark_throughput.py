@@ -49,6 +49,7 @@ def run_config(
     kv_pool_tokens: int,
     prompts: list[list[int]],
     params: list[SamplingParams],
+    attention_backend: str = "auto",
 ) -> dict[str, float]:
     llm = LLM(
         model,
@@ -57,6 +58,7 @@ def run_config(
         kv_pool_tokens=kv_pool_tokens,
         max_batch_size=max_batch_size,
         scheduling=scheduling,  # type: ignore[arg-type]
+        attention_backend=attention_backend,  # type: ignore[arg-type]
     )
     start = time.perf_counter()
     outputs = llm.generate(sampling_params=params, prompt_token_ids=prompts, use_tqdm=True)
@@ -87,6 +89,7 @@ def main() -> None:
     parser.add_argument("--max-new-cap", type=int, default=256)
     parser.add_argument("--batch-sizes", default="4,16")
     parser.add_argument("--kv-pool-tokens", type=int, default=16384)
+    parser.add_argument("--attention-backend", choices=["auto", "sdpa", "triton"], default="auto")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -116,7 +119,15 @@ def main() -> None:
     print("\n" + header)
     print("-" * len(header))
     for label, scheduling, batch in configs:
-        r = run_config(args.model, scheduling, batch, args.kv_pool_tokens, prompts, params)
+        r = run_config(
+            args.model,
+            scheduling,
+            batch,
+            args.kv_pool_tokens,
+            prompts,
+            params,
+            args.attention_backend,
+        )
         print(
             f"{label:<18} {r['wall_s']:>9.1f} {r['output_tok_per_s']:>10.1f} "
             f"{r['requests_per_min']:>8.1f} {r['ttft_mean_s']:>10.2f} "

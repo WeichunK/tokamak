@@ -41,6 +41,25 @@ def make_cache(llm: LLM, total_tokens: int) -> KVCacheProtocol:
     )
 
 
+def decode_ctx(llm: LLM, cache: KVCacheProtocol, seq_len: int):
+    """Per-step decode context matching the engine's backend selection."""
+    if llm.attention_backend == "triton":
+        from tokamak.kernels.paged_attention import TritonPagedDecodeContext
+
+        assert llm.paged_cache is not None and llm.block_manager is not None
+        block_size = llm.block_manager.block_size
+        table = llm.block_manager.block_table(0)
+        position = seq_len - 1
+        slot = table[position // block_size] * block_size + position % block_size
+        return TritonPagedDecodeContext(
+            llm.paged_cache,
+            torch.tensor([table], dtype=torch.int32, device=llm.device),
+            torch.tensor([seq_len], dtype=torch.int32, device=llm.device),
+            torch.tensor([slot], dtype=torch.int64, device=llm.device),
+        )
+    return BatchedDecodeContext([cache], [seq_len], llm.device)
+
+
 @torch.inference_mode()
 def run_once(llm: LLM, prompt_ids: list[int], new_tokens: int) -> dict[str, float]:
     device = llm.device
@@ -62,7 +81,7 @@ def run_once(llm: LLM, prompt_ids: list[int], new_tokens: int) -> dict[str, floa
         for _ in range(new_tokens):
             step_ids = torch.tensor([[token]], dtype=torch.long, device=device)
             step_pos = torch.tensor([[pos]], dtype=torch.long, device=device)
-            ctx = BatchedDecodeContext([cache], [pos + 1], device)
+            ctx = decode_ctx(llm, cache, pos + 1)
             hidden = llm.model(step_ids, step_pos, ctx)
             token = int(llm.model.compute_logits(hidden[:, -1]).argmax().item())
             pos += 1
@@ -82,6 +101,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--kv-backend", choices=["contiguous", "paged"], default="paged")
+    parser.add_argument("--attention-backend", choices=["auto", "sdpa", "triton"], default="auto")
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--prompt-tokens", type=int, default=512)
     parser.add_argument("--new-tokens", type=int, default=128)
@@ -96,6 +116,7 @@ def main() -> None:
         max_seq_len=total_tokens,
         kv_backend=args.kv_backend,
         block_size=args.block_size,
+        attention_backend=args.attention_backend if args.kv_backend == "paged" else "sdpa",
     )
     generator = torch.Generator().manual_seed(0)
     prompt_ids = torch.randint(
@@ -111,6 +132,7 @@ def main() -> None:
         "device": str(llm.device),
         "dtype": str(llm.dtype),
         "kv_backend": args.kv_backend,
+        "attention_backend": llm.attention_backend,
         "block_size": args.block_size if args.kv_backend == "paged" else None,
         "prompt_tokens": args.prompt_tokens,
         "new_tokens": args.new_tokens,

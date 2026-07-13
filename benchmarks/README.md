@@ -21,6 +21,7 @@ Workload: 512 synthetic prompt tokens, 128 greedy decode steps, EOS ignored.
 |---|---|---|---|---|
 | M1 — contiguous baseline | 66.3 | 19.0 | 52.6 | 1.40 |
 | M2 — paged, reference gather (block 16) | 73.5 | 15.8 | 63.3 | 1.47 |
+| M4 — paged, Triton kernel (block 16) | 70.7 | 21.0 | 47.6 | 1.47 |
 
 The M1 decode number is the point: a 0.6B model on a 16 GiB GPU decoding at
 19 tok/s means the GPU is idle most of every step — single-sequence, eager-mode
@@ -30,8 +31,35 @@ following milestones are for.
 
 The M2 paged backend is ~17% *slower* per sequence, deliberately: the reference
 implementation materializes K/V through a gather every layer and step so that
-correctness stays auditable. That regression is the measured motivation for the
-M4 attention kernel, which reads block tables in-kernel instead of copying.
+correctness stays auditable. That regression was the measured motivation for the
+M4 attention kernel, which reads block tables in-kernel instead of copying — and
+repays the debt with interest: the kernel path beats even the contiguous
+zero-copy baseline (21.0 vs 19.0 tok/s single-sequence).
+
+## Decode attention in isolation (`benchmark_attention.py`)
+
+One decode step's attention (write new K/V + attend), Qwen3-0.6B shapes
+(16 q-heads / 8 kv-heads, head_dim 128, block 16), bf16, scattered block tables;
+median µs per call. "No-gather SDPA" is eager SDPA over pre-materialized
+contiguous K/V — the cost with memory movement taken off the books.
+
+| Batch | Context | Reference (gather+SDPA) | Triton kernel | No-gather SDPA | Speedup |
+|---|---|---|---|---|---|
+| 1 | 512 | 965 | 241 | 368 | 4.0× |
+| 8 | 512 | 3,954 | 271 | 790 | 14.6× |
+| 16 | 512 | 7,251 | 323 | 1,487 | 22.5× |
+| 16 | 2,048 | 11,495 | 806 | 5,760 | 14.3× |
+| 32 | 512 | 14,401 | 440 | 2,864 | 32.7× |
+| 32 | 2,048 | 22,599 | 1,409 | 11,331 | 16.0× |
+
+Two notes: the kernel beats the "no-gather" SDPA column everywhere — eager SDPA
+at decode shapes pays padded-batch math a fused single-pass kernel avoids — and
+kernel cost grows sub-linearly with batch (241 → 440 µs, 1 → 32 sequences)
+because launches amortize and GQA tile reuse works.
+
+```bash
+uv run python benchmarks/benchmark_attention.py
+```
 
 ## KV reservation waste (`benchmark_kv_memory.py`)
 
@@ -90,8 +118,25 @@ Reading the curve:
   matches the M2 single-sequence numbers. It makes the fleet share hardware that
   one request cannot saturate.
 
+With the M4 Triton kernel (`--attention-backend triton`), same workload:
+
+| Config | Wall (s) | Out tok/s | Req/min | TTFT mean (s) | TTFT p95 (s) | Latency mean (s) | Latency p95 (s) |
+|---|---|---|---|---|---|---|---|
+| sequential | 138.4 | 21.0 | 13.9 | 78.2 | 132.6 | 82.5 | 136.8 |
+| static b=4 | 72.1 | 40.2 | 26.6 | 37.3 | 67.6 | 41.7 | 69.2 |
+| continuous b=4 | 37.2 | 77.9 | 51.6 | 17.5 | 33.0 | 22.0 | 35.9 |
+| static b=16 | 26.2 | 110.7 | 73.2 | 7.1 | 14.1 | 11.8 | 19.7 |
+| continuous b=16 | 16.4 | 176.6 | 116.9 | 2.7 | 7.4 | 8.0 | 14.9 |
+
+The kernel's win grows with batch size exactly as the microbenchmark predicts
+(the gather it deletes scales with rows): 1.36× at batch 1, 1.85× at continuous
+b=4, **2.7× at continuous b=16**. Compounded across milestones, the engine went
+from 15.4 tok/s (sequential, reference attention) to **176.6 tok/s** — 11.5× —
+on identical hardware and workload.
+
 ```bash
 uv run python benchmarks/benchmark_throughput.py
+uv run python benchmarks/benchmark_throughput.py --attention-backend triton
 ```
 
 Reproduce with:

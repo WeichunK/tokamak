@@ -37,6 +37,14 @@ dependencies = [
     "tqdm>=4.66",
 ]
 
+[project.optional-dependencies]
+# Custom attention kernels (M4). Triton has no official Windows wheels; the
+# community triton-windows port tracks upstream and works with the cu126 stack.
+triton = [
+    "triton>=3.2; sys_platform == 'linux'",
+    "triton-windows>=3.2; sys_platform == 'win32'",
+]
+
 [project.urls]
 Repository = "https://github.com/WeichunK/tokamak"
 Issues = "https://github.com/WeichunK/tokamak/issues"
@@ -101,6 +109,8 @@ convention = "google"
 "tests/**" = ["D"]
 "examples/**" = ["D"]
 "benchmarks/**" = ["D"]
+# Uppercase tl.constexpr parameters are the Triton kernel convention.
+"src/tokamak/kernels/*" = ["N803"]
 
 # python_version is left at the interpreter default: numpy's stubs use PEP 695
 # syntax that mypy rejects under a 3.11 target. 3.11 compatibility is covered by
@@ -112,8 +122,17 @@ pretty = true
 warn_unreachable = true
 
 [[tool.mypy.overrides]]
-module = ["transformers.*", "safetensors.*", "tqdm.*"]
+module = ["transformers.*", "safetensors.*", "tqdm.*", "triton.*"]
 ignore_missing_imports = true
+
+# Triton JIT kernels cannot carry full Python type annotations: tl.constexpr
+# parameters are annotated (making the def "incomplete"), pointer/stride
+# parameters cannot be.
+[[tool.mypy.overrides]]
+module = ["tokamak.kernels.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_decorators = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

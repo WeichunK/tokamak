@@ -20,7 +20,7 @@ every milestone: **prove it correct, then measure what it buys.**
 | M2 | Paged KV cache (block manager + paged attention) | ✅ |
 | M3 | Continuous batching (iteration-level scheduling) | ✅ |
 | M4 | Custom Triton attention kernels | ✅ |
-| M5 | Speculative decoding (draft + rejection sampling) | ⬜ |
+| M5 | Speculative decoding (draft + rejection sampling) | ✅ |
 | M6 | Benchmark & gap analysis vs. vLLM | ⬜ |
 | M7 | Experimental attention backends (sparse / linear attention) | ⬜ |
 
@@ -71,11 +71,14 @@ src/tokamak/
 ├── kernels/
 │   └── paged_attention.py# Triton decode kernel: in-place block-table attention
 ├── sampling/sampler.py   # temperature → top-k → top-p → multinomial
+├── speculative/
+│   └── rejection.py      # distribution-preserving draft verification
 └── engine/
     ├── llm.py            # offline LLM API driving the scheduler step loop
     ├── scheduler.py      # iteration-level FCFS scheduling + preemption (Orca-style)
+    ├── speculative.py    # draft-and-verify runner (chunked verification forwards)
     ├── sequence.py       # request state machine
-    └── outputs.py        # RequestOutput (+ TTFT / latency metrics)
+    └── outputs.py        # RequestOutput (+ TTFT / latency / acceptance metrics)
 ```
 
 (`model/step_context.py` holds the prefill/batched-decode contexts that let one
@@ -105,9 +108,14 @@ continuous batching turns the reclaimed memory into throughput: 4.2× tokens/s a
 14× better mean TTFT over sequential serving on a 32-request workload. M4's
 Triton paged-attention kernel then deletes the gather: 4–33× faster decode
 attention than the reference path (faster than no-gather eager SDPA, too), which
-repays the M2 debt with interest. The M6 comparison against vLLM (same model,
-same traces, same GPU) comes with an honest analysis of the gap and where it
-comes from.
+repays the M2 debt with interest. M5's speculative decoding is the honest
+counterpoint: the algorithm is verified exactly (40k-round distribution tests,
+token-identical greedy), yet it *loses* on this stack (0.74× at k=2) — because
+every decode step pays the same launch-overhead floor, the draft:target
+step-cost ratio is ~0.7 where the theory needs ~0.2, and the predicted and
+measured slowdowns agree. The M6 comparison against vLLM (same model, same
+traces, same GPU) comes with an honest analysis of the gap and where it comes
+from.
 
 ## Development
 

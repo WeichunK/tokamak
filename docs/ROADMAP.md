@@ -72,16 +72,21 @@ faster than no-gather eager SDPA at every measured shape, single-sequence decode
 21.0 tok/s vs the 15.8 reference / 19.0 contiguous baselines. Design notes:
 [design/004-triton-paged-attention.md](design/004-triton-paged-attention.md).
 
-## M5 — Speculative decoding ⬜
+## M5 — Speculative decoding ✅
 
 Draft-model speculative decoding with rejection sampling (Leviathan et al., 2023;
 Chen et al., 2023): a small draft model proposes k tokens, the target model verifies
 them in a single forward pass, and rejection sampling preserves the target
 distribution exactly.
 
-**Exit criteria:** output distribution is provably unchanged (greedy outputs
-token-identical; sampled outputs pass a distribution test); acceptance-rate and
-speedup measurements are recorded.
+**Exit criteria (met):** output distribution provably unchanged — greedy outputs
+token-identical to plain decoding for self- and foreign drafts; 40k-round empirical
+distribution tests within TV 0.01 of the target with acceptance matching the
+analytic Σ min(p, q). Acceptance and speedup recorded — and honest: on this
+launch-latency-bound stack the draft:target step-cost ratio is ~0.7 (vs. the ~0.2
+the theory wants), so speculation measures 0.74× at k=2 with 57% acceptance; the
+predicted and measured slowdowns agree, which is the point. Design notes:
+[design/005-speculative-decoding.md](design/005-speculative-decoding.md).
 
 ## M6 — Benchmark against vLLM ⬜
 

@@ -22,6 +22,8 @@ class RequestOutput:
         finish_reason: Why generation stopped.
         ttft_s: Time from submission to the first sampled token (seconds).
         latency_s: Time from submission to completion (seconds).
+        spec_proposed: Draft tokens proposed (speculative decoding only).
+        spec_accepted: Draft tokens accepted; the ratio is the acceptance rate.
     """
 
     request_id: int
@@ -32,3 +34,5 @@ class RequestOutput:
     finish_reason: FinishReason
     ttft_s: float | None = None
     latency_s: float | None = None
+    spec_proposed: int | None = None
+    spec_accepted: int | None = None

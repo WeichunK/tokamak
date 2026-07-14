@@ -64,6 +64,9 @@ class Sequence:
         self.arrival_time: float | None = None
         self.first_token_time: float | None = None
         self.finish_time: float | None = None
+        # Speculative-decoding statistics (stay 0 on the plain path).
+        self.spec_proposed = 0
+        self.spec_accepted = 0
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -102,6 +105,26 @@ class Sequence:
         if self.is_finished:
             raise RuntimeError(f"Sequence {self.seq_id} is already finished")
         self.output_token_ids.append(token_id)
+
+    def append_checked(
+        self,
+        token_id: int,
+        *,
+        eos_token_ids: tuple[int, ...],
+        max_total_tokens: int,
+    ) -> bool:
+        """Append one token and apply the stop conditions; True when finished.
+
+        Stop conditions, in order: EOS (unless ``ignore_eos``), the request's
+        ``max_new_tokens``, and the engine's context budget ``max_total_tokens``.
+        """
+        self.append_output_token(token_id)
+        params = self.sampling_params
+        if not params.ignore_eos and token_id in eos_token_ids:
+            self.finish(FinishReason.STOP)
+        elif self.num_output_tokens >= params.max_new_tokens or self.num_tokens >= max_total_tokens:
+            self.finish(FinishReason.LENGTH)
+        return self.is_finished
 
     def finish(self, reason: FinishReason) -> None:
         """Mark the sequence as finished."""

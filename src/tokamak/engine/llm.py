@@ -30,7 +30,8 @@ from tokamak import kernels
 from tokamak.config import ModelConfig, resolve_device, resolve_dtype
 from tokamak.engine.outputs import RequestOutput
 from tokamak.engine.scheduler import ScheduledBatch, Scheduler, StepKind
-from tokamak.engine.sequence import FinishReason, Sequence
+from tokamak.engine.sequence import Sequence
+from tokamak.engine.speculative import SpeculativeRunner
 from tokamak.memory import BlockManager, PagedKVCache, PagedKVCacheView
 from tokamak.model.kv_cache import ContiguousKVCache, KVCacheProtocol
 from tokamak.model.loader import build_model, load_weights, resolve_model_path
@@ -85,6 +86,12 @@ class LLM:
             kernel, reading block tables in place (requires the ``triton``
             extra, CUDA, and the paged KV backend). ``"auto"`` (default) picks
             the kernel when available. Prefill always uses SDPA.
+        draft_model: Optional draft checkpoint enabling speculative decoding
+            (must share the target's vocabulary). Requests then run one at a
+            time through the draft-and-verify loop with per-request contiguous
+            caches — speculative mode is not composed with continuous batching
+            or the paged pool in this milestone.
+        num_speculative_tokens: Draft proposals per verification step (``k``).
     """
 
     def __init__(
@@ -100,6 +107,8 @@ class LLM:
         max_batch_size: int = 16,
         scheduling: Literal["continuous", "static"] = "continuous",
         attention_backend: Literal["auto", "sdpa", "triton"] = "auto",
+        draft_model: str | None = None,
+        num_speculative_tokens: int = 4,
     ) -> None:
         if kv_backend not in ("contiguous", "paged"):
             raise ValueError(f"Unknown kv_backend: {kv_backend!r}")
@@ -107,6 +116,10 @@ class LLM:
             raise ValueError(f"block_size must be >= 1, got {block_size}")
         if max_batch_size < 1:
             raise ValueError(f"max_batch_size must be >= 1, got {max_batch_size}")
+        if draft_model is not None:
+            # Speculative mode uses per-request contiguous caches (chunked
+            # verification forwards; no shared pool, no kernel decode path).
+            kv_backend = "contiguous"
         model_path = resolve_model_path(model)
         self.device = resolve_device(device)
         self.dtype = resolve_dtype(dtype, self.device)
@@ -160,6 +173,39 @@ class LLM:
         )
         self.model = build_model(self.model_config, self.device, self.dtype)
         load_weights(self.model, model_path)
+
+        self._spec_runner: SpeculativeRunner | None = None
+        if draft_model is not None:
+            self._spec_runner = self._build_spec_runner(draft_model, num_speculative_tokens)
+
+    def _build_spec_runner(
+        self, draft_model: str, num_speculative_tokens: int
+    ) -> SpeculativeRunner:
+        """Load the draft checkpoint and wire up the draft-and-verify loop."""
+        draft_path = resolve_model_path(draft_model)
+        draft_hf_config = AutoConfig.from_pretrained(draft_path)
+        draft_config = ModelConfig.from_hf(
+            draft_hf_config, eos_token_ids=self.model_config.eos_token_ids
+        )
+        if draft_config.vocab_size != self.model_config.vocab_size:
+            raise ValueError(
+                f"draft vocab ({draft_config.vocab_size}) != target vocab "
+                f"({self.model_config.vocab_size}); speculative decoding requires a "
+                f"shared tokenizer"
+            )
+        logger.info("Loading draft %s (%s)", draft_model, draft_config.architecture)
+        draft = build_model(draft_config, self.device, self.dtype)
+        load_weights(draft, draft_path)
+        return SpeculativeRunner(
+            target=self.model,
+            target_config=self.model_config,
+            draft=draft,
+            draft_config=draft_config,
+            num_speculative_tokens=num_speculative_tokens,
+            max_seq_len=self.max_seq_len,
+            device=self.device,
+            dtype=self.dtype,
+        )
 
     def _resolve_attention_backend(
         self, requested: Literal["auto", "sdpa", "triton"]
@@ -232,6 +278,16 @@ class LLM:
             seq.arrival_time = arrival
             self._validate_fits(seq)
             sequences.append(seq)
+
+        if self._spec_runner is not None:
+            with tqdm(total=len(sequences), desc="Generating", disable=not use_tqdm) as pbar:
+                for seq in sequences:
+                    self._spec_runner.run(seq)
+                    pbar.update(1)
+            return [
+                self._to_output(seq, prompt_texts[seq.seq_id] if prompt_texts else None)
+                for seq in sequences
+            ]
 
         scheduler = Scheduler(self.block_manager, self.max_batch_size, self.scheduling)
         for seq in sequences:
@@ -341,20 +397,18 @@ class LLM:
             self._generators[seq.seq_id] = generator
 
         token_id = int(sample(logits, params, generator).item())
-        seq.append_output_token(token_id)
+        finished = seq.append_checked(
+            token_id,
+            eos_token_ids=self.model_config.eos_token_ids,
+            max_total_tokens=self._max_total_tokens(seq),
+        )
         if seq.first_token_time is None:
             seq.first_token_time = time.perf_counter()
+        if finished:
+            self._release_finished(seq)
 
-        if not params.ignore_eos and token_id in self.model_config.eos_token_ids:
-            self._finish(seq, FinishReason.STOP)
-        elif (
-            seq.num_output_tokens >= params.max_new_tokens
-            or seq.num_tokens >= self._max_total_tokens(seq)
-        ):
-            self._finish(seq, FinishReason.LENGTH)
-
-    def _finish(self, seq: Sequence, reason: FinishReason) -> None:
-        seq.finish(reason)
+    def _release_finished(self, seq: Sequence) -> None:
+        """Stamp completion time and return the request's pooled resources."""
         seq.finish_time = time.perf_counter()
         cache = self._caches.pop(seq.seq_id, None)
         if cache is not None:
@@ -429,6 +483,8 @@ class LLM:
             finish_reason=seq.finish_reason,
             ttft_s=ttft,
             latency_s=latency,
+            spec_proposed=seq.spec_proposed if self._spec_runner else None,
+            spec_accepted=seq.spec_accepted if self._spec_runner else None,
         )
 
     def _decode(self, token_ids: list[int]) -> str:

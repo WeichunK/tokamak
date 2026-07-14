@@ -86,6 +86,32 @@ def test_triton_backend_matches_sdpa_greedy() -> None:
     assert actual == expected
 
 
+def test_speculative_same_model_matches_plain_greedy() -> None:
+    """Self-drafting must reproduce plain greedy output with near-total acceptance."""
+    prompts = ["The capital of France is"]
+    params = SamplingParams(temperature=0.0, max_new_tokens=24, ignore_eos=True)
+
+    plain = LLM(MODEL_ID, device="cpu", dtype=torch.float32, max_seq_len=128)
+    expected = [o.output_token_ids for o in plain.generate(prompts, params, use_tqdm=False)]
+    del plain
+
+    spec = LLM(
+        MODEL_ID,
+        device="cpu",
+        dtype=torch.float32,
+        max_seq_len=128,
+        draft_model=MODEL_ID,
+        num_speculative_tokens=4,
+    )
+    outputs = spec.generate(prompts, params, use_tqdm=False)
+
+    assert [o.output_token_ids for o in outputs] == expected
+    assert outputs[0].spec_proposed is not None and outputs[0].spec_accepted is not None
+    # Identical models: disagreements can only come from chunked-vs-stepwise
+    # float noise on near-ties, which must be rare.
+    assert outputs[0].spec_accepted / outputs[0].spec_proposed > 0.9
+
+
 def test_preemption_preserves_greedy_output() -> None:
     """Preemption-by-recomputation must be invisible in the generated tokens.
 

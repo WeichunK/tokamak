@@ -150,6 +150,28 @@ def test_batched_decode_matches_sequential() -> None:
 
 
 @torch.inference_mode()
+def test_chunked_forward_matches_full_forward() -> None:
+    """Mid-cache multi-token chunks (speculative verification) must be exact."""
+    config = tiny_config()
+    model = make_model(config)
+    generator = torch.Generator().manual_seed(3)
+    token_ids = torch.randint(0, config.vocab_size, (1, 12), generator=generator)
+
+    full_logits = full_forward_logits(model, config, token_ids)
+
+    cache = make_cache(config)
+    chunks = [(0, 5), (5, 9), (9, 12)]  # prefill, then two mid-cache chunks
+    chunk_logits = []
+    for start, end in chunks:
+        ctx = PrefillContext(cache, start_pos=start)
+        positions = torch.arange(start, end)[None]
+        hidden = model(token_ids[:, start:end], positions, ctx)
+        chunk_logits.append(model.compute_logits(hidden))
+
+    torch.testing.assert_close(torch.cat(chunk_logits, dim=1), full_logits, rtol=1e-4, atol=1e-4)
+
+
+@torch.inference_mode()
 def test_logits_causality() -> None:
     """Changing a future token must not change logits at earlier positions."""
     config = tiny_config()

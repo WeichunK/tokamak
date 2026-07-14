@@ -53,23 +53,39 @@ class StepContextProtocol(Protocol):
 
 
 class PrefillContext:
-    """One sequence's prompt (or recomputation) starting at position 0."""
+    """A contiguous chunk of one sequence, written at ``start_pos``.
 
-    def __init__(self, cache: KVCacheProtocol) -> None:
+    ``start_pos=0`` is a full prompt prefill (square causal attention).
+    ``start_pos>0`` is a *chunked* forward — several tokens appended to an
+    existing cache in one pass, as speculative verification needs: query row
+    ``i`` (absolute position ``start_pos + i``) may attend to every cached
+    position up to and including itself.
+    """
+
+    def __init__(self, cache: KVCacheProtocol, start_pos: int = 0) -> None:
         self._cache = cache
+        self._start_pos = start_pos
 
     def attend(
         self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
-        """Write the full prompt, then run square causal attention over it.
+        """Write the chunk, then attend causally over everything cached so far.
 
-        SDPA's ``is_causal`` aligns the mask to the top-left corner, which is
-        correct exactly because prefill queries and keys have equal length.
+        For ``start_pos=0`` queries and keys have equal length, which is exactly
+        when SDPA's top-left-aligned ``is_causal`` is correct. For a mid-cache
+        chunk the matrix is rectangular, so the causal structure is expressed
+        with an explicit boolean mask instead.
         """
-        k_all, v_all = self._cache.update(layer_idx, k, v, start_pos=0)
-        return F.scaled_dot_product_attention(
-            q, k_all, v_all, is_causal=q.shape[2] > 1, enable_gqa=True
-        )
+        k_all, v_all = self._cache.update(layer_idx, k, v, start_pos=self._start_pos)
+        if self._start_pos == 0:
+            return F.scaled_dot_product_attention(
+                q, k_all, v_all, is_causal=q.shape[2] > 1, enable_gqa=True
+            )
+        q_len, kv_len = q.shape[2], k_all.shape[2]
+        rows = torch.arange(q_len, device=q.device)
+        cols = torch.arange(kv_len, device=q.device)
+        mask = (cols[None, :] <= self._start_pos + rows[:, None])[None, None]
+        return F.scaled_dot_product_attention(q, k_all, v_all, attn_mask=mask, enable_gqa=True)
 
 
 class BatchedDecodeContext:

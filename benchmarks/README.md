@@ -139,6 +139,39 @@ uv run python benchmarks/benchmark_throughput.py
 uv run python benchmarks/benchmark_throughput.py --attention-backend triton
 ```
 
+## Speculative decoding (`benchmark_speculative.py`)
+
+Qwen3-4B target, Qwen3-0.6B draft, greedy, single-sequence, natural-language
+continuation prompts (4 × 128 new tokens). The baseline is the same engine
+without a draft (best backend, i.e. the M4 kernel).
+
+| Config | Wall (s) | Tok/s | Speedup | Acceptance |
+|---|---|---|---|---|
+| baseline (target only) | 35.1 | 14.6 | 1.00× | — |
+| speculative k=2 | 47.3 | 10.8 | 0.74× | 57.0% |
+| speculative k=4 | 64.9 | 7.9 | 0.54× | 37.2% |
+| speculative k=6 | 76.1 | 6.7 | 0.46× | 30.9% |
+
+**Speculative decoding loses on this stack, and the arithmetic says it must.**
+The economics of speculation depend on the draft:target *step-cost* ratio ``c``;
+the theory pays off around ``c ≲ 0.2``. Here every decode step — 0.6B or 4B —
+sits on the same ~50 ms Python/kernel-launch overhead floor (M1's finding), so
+``c ≈ 0.7`` despite a 7× parameter gap. Sanity check at k=2: an iteration costs
+about 2 × 48 ms (draft) + 68 ms (verify) ≈ 164 ms and yields ≈ 1.9 tokens at 57%
+acceptance → 86 ms/token vs. the baseline's 68 ms — predicting 0.79×, measuring
+0.74× (the residual is the mode's integration gap: contiguous caches + SDPA
+verify, no M4 kernel).
+
+The algorithm itself is verified exactly (distribution tests, token-identical
+greedy); what fails is the cost model this hardware offers it. Production
+engines lower the overhead floor (CUDA graphs, fused runners) *before*
+speculation multiplies — a measured argument for why serving-stack overhead
+work precedes algorithmic acceleration.
+
+```bash
+uv run python benchmarks/benchmark_speculative.py
+```
+
 Reproduce with:
 
 ```bash

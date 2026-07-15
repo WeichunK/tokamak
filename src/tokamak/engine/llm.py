@@ -360,6 +360,7 @@ class LLM:
 
     def _decode_step(self, seqs: list[Sequence]) -> None:
         """Advance every running sequence one token in a single forward pass."""
+        self._reclaim_dead_blocks(seqs)
         caches = []
         for seq in seqs:
             cache = self._caches[seq.seq_id]
@@ -385,6 +386,22 @@ class LLM:
         logits = self.model.compute_logits(hidden[:, -1])
         for i, seq in enumerate(seqs):
             self._append_sampled(seq, logits[i : i + 1])
+
+    def _reclaim_dead_blocks(self, seqs: list[Sequence]) -> None:
+        """Return blocks no present-or-future query can see to the paged pool.
+
+        The recency band of a windowed policy only moves forward, so this
+        step's query position already determines which whole blocks are dead.
+        Reclaimed capacity feeds straight back into scheduler admission.
+        """
+        policy = self.attention_policy
+        if policy.is_full or self.block_manager is None:
+            return
+        block_size = self.block_manager.block_size
+        sink_blocks = -(-policy.sinks // block_size)
+        for seq in seqs:
+            first_live = policy.band_start(seq.num_tokens - 1) // block_size
+            self.block_manager.release_out_of_window(seq.seq_id, first_live, sink_blocks)
 
     def _triton_decode_context(self, seqs: list[Sequence]) -> StepContextProtocol:
         """Build block-table / slot tensors for the kernel-backed decode step."""

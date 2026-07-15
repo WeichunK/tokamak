@@ -47,6 +47,9 @@ class BlockManager:
         # LIFO free list: recently freed (cache-warm) blocks are reused first.
         self._free_blocks = list(range(num_blocks - 1, -1, -1))
         self._block_tables: dict[int, list[int]] = {}
+        # Logical index range [lo, hi) of each sequence's table entries already
+        # released by release_out_of_window (windowed attention policies).
+        self._released: dict[int, tuple[int, int]] = {}
 
     @property
     def num_free_blocks(self) -> int:
@@ -89,12 +92,54 @@ class BlockManager:
         for _ in range(shortfall):
             table.append(self._free_blocks.pop())
 
+    def release_out_of_window(
+        self, seq_id: int, first_live_block: int, sink_blocks: int = 0
+    ) -> int:
+        """Return blocks that no present or future query can see to the pool.
+
+        Under a windowed attention policy the visible set's recency band only
+        moves forward, so once every token of a logical block sits below the
+        band (and above the sink prefix) the block is dead forever. Released
+        entries *keep their stale ids in the table* — the physical block may be
+        reallocated to another sequence at any time, so consumers must never
+        dereference logical blocks outside the policy's visible set. The Triton
+        kernel guarantees this structurally (its two passes skip the dead
+        range); the reference gather reads them and masks the scores, which is
+        correct but does touch dead bytes.
+
+        Args:
+            seq_id: The sequence (no-op for unknown ids).
+            first_live_block: First logical block any current-or-future query
+                may still see, ``policy.band_start(pos) // block_size``.
+            sink_blocks: Leading blocks pinned by sink positions,
+                ``ceil(policy.sinks / block_size)``.
+
+        Returns:
+            Number of blocks returned to the pool by this call.
+        """
+        table = self._block_tables.get(seq_id)
+        if table is None:
+            return 0
+        lo0, hi0 = self._released.get(seq_id, (sink_blocks, sink_blocks))
+        hi = min(max(first_live_block, hi0), len(table))
+        for logical in range(hi0, hi):
+            self._free_blocks.append(table[logical])
+        if hi > hi0:
+            self._released[seq_id] = (lo0, hi)
+        return hi - hi0
+
     def free(self, seq_id: int) -> None:
-        """Return the sequence's blocks to the pool (no-op for unknown ids)."""
+        """Return the sequence's blocks to the pool (no-op for unknown ids).
+
+        Entries already returned by :meth:`release_out_of_window` are skipped —
+        their physical blocks may belong to someone else by now.
+        """
         table = self._block_tables.pop(seq_id, None)
         if table:
-            self._free_blocks.extend(table)
+            lo, hi = self._released.pop(seq_id, (0, 0))
+            self._free_blocks.extend(block for i, block in enumerate(table) if not lo <= i < hi)
 
     def reserved_tokens(self, seq_id: int) -> int:
-        """Token capacity currently reserved by the sequence's blocks."""
-        return len(self.block_table(seq_id)) * self.block_size
+        """Token capacity currently reserved by the sequence's live blocks."""
+        lo, hi = self._released.get(seq_id, (0, 0))
+        return (len(self.block_table(seq_id)) - (hi - lo)) * self.block_size

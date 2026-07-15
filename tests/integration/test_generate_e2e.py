@@ -113,13 +113,15 @@ def test_wide_window_matches_full_greedy() -> None:
 def test_windowed_triton_matches_windowed_sdpa_greedy() -> None:
     """The kernel's two-phase visibility walk must reproduce the masked reference.
 
-    The window (16 + 2 sinks) is far smaller than prompt + 32 new tokens, so
-    the policy genuinely restricts most decode steps.
+    The window (16 + 2 sinks) is far smaller than prompt + 96 new tokens, so
+    the policy restricts most decode steps, whole blocks go dead behind the
+    band (block reclamation runs for real), and the kernel walks a table whose
+    dead entries are stale.
     """
     if not kernels.is_available():
         pytest.skip("CUDA + triton required")
     prompts = ["The capital of France is", "1 + 1 ="]
-    params = SamplingParams(temperature=0.0, max_new_tokens=32, ignore_eos=True)
+    params = SamplingParams(temperature=0.0, max_new_tokens=96, ignore_eos=True)
     policy = "streaming:16+2"
 
     reference = LLM(MODEL_ID, max_seq_len=512, attention_backend="sdpa", attention_policy=policy)
@@ -128,9 +130,25 @@ def test_windowed_triton_matches_windowed_sdpa_greedy() -> None:
     torch.cuda.empty_cache()
 
     kernel = LLM(MODEL_ID, max_seq_len=512, attention_backend="triton", attention_policy=policy)
+    assert kernel.block_manager is not None
+    baseline_free = kernel.block_manager.num_free_blocks
+    reclaimed = []
+    original = kernel.block_manager.release_out_of_window
+
+    def spying_release(seq_id: int, first_live_block: int, sink_blocks: int = 0) -> int:
+        count = original(seq_id, first_live_block, sink_blocks)
+        if count:
+            reclaimed.append(count)
+        return count
+
+    kernel.block_manager.release_out_of_window = spying_release  # type: ignore[method-assign]
     actual = [o.output_token_ids for o in kernel.generate(prompts, params, use_tqdm=False)]
 
     assert actual == expected
+    # ~100-token sequences under a 16+2 window must shed several 16-token
+    # blocks each, and everything must land back in the pool afterwards.
+    assert sum(reclaimed) >= 8
+    assert kernel.block_manager.num_free_blocks == baseline_free
 
 
 def test_speculative_same_model_matches_plain_greedy() -> None:

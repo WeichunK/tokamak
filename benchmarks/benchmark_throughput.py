@@ -15,27 +15,13 @@ Usage:
 """
 
 import argparse
-import random
 import statistics
 import time
 
 import torch
+from workload import build_workload
 
 from tokamak import LLM, SamplingParams
-
-
-def build_workload(
-    num_requests: int, max_new_cap: int, vocab_size: int, seed: int
-) -> tuple[list[list[int]], list[SamplingParams]]:
-    rng = random.Random(seed)
-    prompts = []
-    params = []
-    for _ in range(num_requests):
-        prompt_len = int(min(max(rng.lognormvariate(5.0, 0.7), 16), 512))
-        new_tokens = min(int(rng.expovariate(1 / 120)) + 8, max_new_cap)
-        prompts.append([rng.randrange(vocab_size) for _ in range(prompt_len)])
-        params.append(SamplingParams(temperature=0.0, max_new_tokens=new_tokens, ignore_eos=True))
-    return prompts, params
 
 
 def percentile(values: list[float], p: float) -> float:
@@ -99,14 +85,13 @@ def main() -> None:
         configs.append((f"static b={batch}", "static", batch))
         configs.append((f"continuous b={batch}", "continuous", batch))
 
-    # Workload is built once and replayed identically for every config.
-    probe = LLM(args.model, max_seq_len=1024, kv_pool_tokens=16384)
-    vocab_size = probe.model_config.vocab_size
-    del probe
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    prompts, params = build_workload(args.num_requests, args.max_new_cap, vocab_size, args.seed)
-    total_new = sum(p.max_new_tokens for p in params)
+    # Workload is built once (shared with benchmark_vllm.py) and replayed
+    # identically for every config.
+    prompts, new_tokens = build_workload(args.num_requests, args.max_new_cap, args.seed)
+    params = [
+        SamplingParams(temperature=0.0, max_new_tokens=n, ignore_eos=True) for n in new_tokens
+    ]
+    total_new = sum(new_tokens)
     print(
         f"workload: {args.num_requests} requests, {sum(map(len, prompts))} prompt tokens, "
         f"{total_new} output tokens (seed {args.seed})"

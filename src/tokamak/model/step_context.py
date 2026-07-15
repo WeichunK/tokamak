@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING, Protocol
 import torch
 import torch.nn.functional as F  # noqa: N812
 
+from tokamak.model.attention_policy import FULL_ATTENTION, AttentionPolicy
+
 if TYPE_CHECKING:
     from collections.abc import Sequence as AbcSequence
 
@@ -62,30 +64,42 @@ class PrefillContext:
     position up to and including itself.
     """
 
-    def __init__(self, cache: KVCacheProtocol, start_pos: int = 0) -> None:
+    def __init__(
+        self,
+        cache: KVCacheProtocol,
+        start_pos: int = 0,
+        policy: AttentionPolicy = FULL_ATTENTION,
+    ) -> None:
         self._cache = cache
         self._start_pos = start_pos
+        self._policy = policy
 
     def attend(
         self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
-        """Write the chunk, then attend causally over everything cached so far.
+        """Write the chunk, then attend causally over everything each row sees.
 
-        For ``start_pos=0`` queries and keys have equal length, which is exactly
-        when SDPA's top-left-aligned ``is_causal`` is correct. For a mid-cache
-        chunk the matrix is rectangular, so the causal structure is expressed
-        with an explicit boolean mask instead.
+        For a full-visibility prompt prefill (``start_pos=0``) queries and keys
+        have equal length, which is exactly when SDPA's top-left-aligned
+        ``is_causal`` is correct. Every other case — mid-cache chunk, windowed
+        or sink-augmented visibility — is a boolean mask: causal, banded to the
+        policy's recency window, with sink columns re-enabled.
         """
         k_all, v_all = self._cache.update(layer_idx, k, v, start_pos=self._start_pos)
-        if self._start_pos == 0:
+        if self._start_pos == 0 and self._policy.is_full:
             return F.scaled_dot_product_attention(
                 q, k_all, v_all, is_causal=q.shape[2] > 1, enable_gqa=True
             )
         q_len, kv_len = q.shape[2], k_all.shape[2]
-        rows = torch.arange(q_len, device=q.device)
+        rows = self._start_pos + torch.arange(q_len, device=q.device)  # absolute positions
         cols = torch.arange(kv_len, device=q.device)
-        mask = (cols[None, :] <= self._start_pos + rows[:, None])[None, None]
-        return F.scaled_dot_product_attention(q, k_all, v_all, attn_mask=mask, enable_gqa=True)
+        mask = cols[None, :] <= rows[:, None]
+        if not self._policy.is_full:
+            band = torch.tensor([self._policy.band_start(int(p)) for p in rows], device=q.device)
+            mask &= (cols[None, :] >= band[:, None]) | (cols[None, :] < self._policy.sinks)
+        return F.scaled_dot_product_attention(
+            q, k_all, v_all, attn_mask=mask[None, None], enable_gqa=True
+        )
 
 
 class BatchedDecodeContext:
@@ -103,6 +117,7 @@ class BatchedDecodeContext:
         caches: AbcSequence[KVCacheProtocol],
         seq_lens: AbcSequence[int],
         device: torch.device,
+        policy: AttentionPolicy = FULL_ATTENTION,
     ) -> None:
         if len(caches) != len(seq_lens):
             raise ValueError(f"{len(caches)} caches for {len(seq_lens)} seq_lens")
@@ -111,8 +126,15 @@ class BatchedDecodeContext:
         self.max_len = max(self._seq_lens)
         lens = torch.tensor(self._seq_lens, device=device)
         cols = torch.arange(self.max_len, device=device)
-        # [batch, 1, 1, max_len]: True where the column is a real position.
-        self.attn_mask = (cols[None, :] < lens[:, None])[:, None, None, :]
+        # [batch, 1, 1, max_len]: True where the column is a real position the
+        # policy lets this row's query (at position len-1) see.
+        mask = cols[None, :] < lens[:, None]
+        if not policy.is_full:
+            band = torch.tensor(
+                [policy.band_start(length - 1) for length in self._seq_lens], device=device
+            )
+            mask &= (cols[None, :] >= band[:, None]) | (cols[None, :] < policy.sinks)
+        self.attn_mask = mask[:, None, None, :]
 
     def attend(
         self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor

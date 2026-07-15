@@ -33,6 +33,7 @@ from tokamak.engine.scheduler import ScheduledBatch, Scheduler, StepKind
 from tokamak.engine.sequence import Sequence
 from tokamak.engine.speculative import SpeculativeRunner
 from tokamak.memory import BlockManager, PagedKVCache, PagedKVCacheView
+from tokamak.model.attention_policy import AttentionPolicy
 from tokamak.model.kv_cache import ContiguousKVCache, KVCacheProtocol
 from tokamak.model.loader import build_model, load_weights, resolve_model_path
 from tokamak.model.step_context import (
@@ -86,6 +87,14 @@ class LLM:
             kernel, reading block tables in place (requires the ``triton``
             extra, CUDA, and the paged KV backend). ``"auto"`` (default) picks
             the kernel when available. Prefill always uses SDPA.
+        attention_policy: Visibility rule applied by every attention step:
+            ``"full"`` (default), ``"window:W"`` (sliding window of the last
+            ``W`` positions), or ``"streaming:W+S"`` (window plus ``S``
+            always-visible sink positions, StreamingLLM-style); an
+            :class:`~tokamak.model.attention_policy.AttentionPolicy` instance
+            also works. Windowed policies are inference-time *approximations*
+            of a dense-attention model — measure the quality cost before
+            trusting one (see ``benchmarks/benchmark_quality.py``).
         draft_model: Optional draft checkpoint enabling speculative decoding
             (must share the target's vocabulary). Requests then run one at a
             time through the draft-and-verify loop with per-request contiguous
@@ -107,11 +116,18 @@ class LLM:
         max_batch_size: int = 16,
         scheduling: Literal["continuous", "static"] = "continuous",
         attention_backend: Literal["auto", "sdpa", "triton"] = "auto",
+        attention_policy: str | AttentionPolicy = "full",
         draft_model: str | None = None,
         num_speculative_tokens: int = 4,
     ) -> None:
         if kv_backend not in ("contiguous", "paged"):
             raise ValueError(f"Unknown kv_backend: {kv_backend!r}")
+        self.attention_policy = AttentionPolicy.parse(attention_policy)
+        if draft_model is not None and not self.attention_policy.is_full:
+            raise ValueError(
+                "attention_policy is not composed with speculative decoding "
+                "(draft verification assumes full visibility)"
+            )
         if block_size < 1:
             raise ValueError(f"block_size must be >= 1, got {block_size}")
         if max_batch_size < 1:
@@ -337,7 +353,7 @@ class LLM:
         token_ids = seq.all_token_ids
         input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
         positions = torch.arange(len(token_ids), device=self.device)[None]
-        ctx = PrefillContext(cache)
+        ctx = PrefillContext(cache, policy=self.attention_policy)
         hidden = self.model(input_ids, positions, ctx)
         logits = self.model.compute_logits(hidden[:, -1])
         self._append_sampled(seq, logits)
@@ -359,7 +375,12 @@ class LLM:
         if self.attention_backend == "triton":
             ctx: StepContextProtocol = self._triton_decode_context(seqs)
         else:
-            ctx = BatchedDecodeContext(caches, [seq.num_tokens for seq in seqs], self.device)
+            ctx = BatchedDecodeContext(
+                caches,
+                [seq.num_tokens for seq in seqs],
+                self.device,
+                policy=self.attention_policy,
+            )
         hidden = self.model(input_ids, positions, ctx)
         logits = self.model.compute_logits(hidden[:, -1])
         for i, seq in enumerate(seqs):
@@ -381,11 +402,21 @@ class LLM:
             block_tables[i, : len(table)] = torch.tensor(table, dtype=torch.int32)
             position = length - 1
             slots[i] = table[position // block_size] * block_size + position % block_size
+        policy = self.attention_policy
+        win_starts = None
+        if not policy.is_full:
+            win_starts = torch.tensor(
+                [policy.band_start(length - 1) for length in seq_lens],
+                dtype=torch.int32,
+                device=self.device,
+            )
         return TritonPagedDecodeContext(
             self.paged_cache,
             block_tables.to(self.device),
             torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
             slots.to(self.device),
+            win_starts=win_starts,
+            sinks=policy.sinks,
         )
 
     def _append_sampled(self, seq: Sequence, logits: torch.Tensor) -> None:

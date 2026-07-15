@@ -27,6 +27,8 @@ def reference_attention(
     tables: list[list[int]],
     seq_lens: list[int],
     scale: float,
+    win_starts: list[int] | None = None,
+    sinks: int = 0,
 ) -> torch.Tensor:
     """Gather + explicit softmax attention, computed in float64 for headroom."""
     _, block_size, num_kv_heads, _ = k_cache.shape
@@ -40,6 +42,10 @@ def reference_attention(
         k = k.permute(1, 0, 2).repeat_interleave(group, dim=0)  # [Hq, n, D]
         v = v.permute(1, 0, 2).repeat_interleave(group, dim=0)
         scores = torch.einsum("hd,hnd->hn", q[i].double(), k) * scale
+        if win_starts is not None:
+            cols = torch.arange(n, device=q.device)
+            visible = (cols >= win_starts[i]) | (cols < sinks)
+            scores = scores.masked_fill(~visible[None, :], float("-inf"))
         probs = scores.softmax(dim=-1)
         outs.append(torch.einsum("hn,hnd->hd", probs, v))
     return torch.stack(outs)
@@ -115,6 +121,84 @@ def test_kernel_handles_long_context() -> None:
 
     out = paged_attention_decode(q, k_cache, v_cache, block_tables, lens_t, head_dim**-0.5)
     expected = reference_attention(q, k_cache, v_cache, [permutation], [seq_len], head_dim**-0.5)
+    torch.testing.assert_close(out.float(), expected.float(), rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("window", "sinks"),
+    [(2 * 4 + 1, 0), (4 + 2, 3), (1, 1)],  # window-only, streaming, degenerate
+    ids=["window-only", "streaming", "tiny"],
+)
+@torch.inference_mode()
+def test_kernel_windowed_matches_reference(window: int, sinks: int) -> None:
+    """Policy-restricted kernel output vs. the masked gather reference."""
+    torch.manual_seed(3)
+    block_size, head_dim = 4, 16
+    k_cache, v_cache = build_pool(32, block_size, 2, head_dim, torch.float32)
+
+    tables = [[5, 2, 9, 30], [17, 4, 0, 11], [8, 25, 3, 1]]
+    seq_lens = [3 * block_size + 1, block_size, 1]
+    # band_start(len - 1) clipped to sinks, as the engine computes it.
+    win_starts = [max(sinks, n - window) for n in seq_lens]
+    scale = head_dim**-0.5
+
+    q = torch.randn(3, 4, head_dim, device=CUDA)
+    block_tables = torch.zeros(3, 4, dtype=torch.int32, device=CUDA)
+    for i, table in enumerate(tables):
+        block_tables[i, : len(table)] = torch.tensor(table, dtype=torch.int32)
+    lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=CUDA)
+    starts_t = torch.tensor(win_starts, dtype=torch.int32, device=CUDA)
+
+    out = paged_attention_decode(
+        q, k_cache, v_cache, block_tables, lens_t, scale, win_starts=starts_t, sinks=sinks
+    )
+    expected = reference_attention(
+        q, k_cache, v_cache, tables, seq_lens, scale, win_starts=win_starts, sinks=sinks
+    )
+    torch.testing.assert_close(out.float(), expected.float(), rtol=1e-4, atol=1e-5)
+
+
+@torch.inference_mode()
+def test_kernel_never_loads_dead_blocks() -> None:
+    """Blocks between the sink prefix and the window may dangle — prove it.
+
+    Table entries for wholly-invisible blocks are pointed at a NaN-poisoned
+    block. Any load from them would poison the output, so a finite, correct
+    result is proof the kernel skipped them.
+    """
+    torch.manual_seed(4)
+    block_size, head_dim, sinks, window = 4, 16, 2, 5
+    k_cache, v_cache = build_pool(32, block_size, 2, head_dim, torch.float32)
+    poison = 31
+    k_cache[poison] = float("nan")
+    v_cache[poison] = float("nan")
+
+    seq_len = 6 * block_size - 1  # 23: sink block 0, window starts at 18 (block 4)
+    win_start = max(sinks, seq_len - window)
+    clean_table = [7, 12, 3, 20, 9, 14]
+    dead = [b for b in range(len(clean_table)) if b > 0 and (b + 1) * block_size <= win_start]
+    assert dead, "test must actually dangle something"
+    poisoned_table = [poison if b in dead else blk for b, blk in enumerate(clean_table)]
+
+    q = torch.randn(1, 4, head_dim, device=CUDA)
+    lens_t = torch.tensor([seq_len], dtype=torch.int32, device=CUDA)
+    starts_t = torch.tensor([win_start], dtype=torch.int32, device=CUDA)
+    tables_t = torch.tensor([poisoned_table], dtype=torch.int32, device=CUDA)
+
+    out = paged_attention_decode(
+        q, k_cache, v_cache, tables_t, lens_t, head_dim**-0.5, win_starts=starts_t, sinks=sinks
+    )
+    expected = reference_attention(
+        q,
+        k_cache,
+        v_cache,
+        [clean_table],
+        [seq_len],
+        head_dim**-0.5,
+        win_starts=[win_start],
+        sinks=sinks,
+    )
+    assert torch.isfinite(out).all()
     torch.testing.assert_close(out.float(), expected.float(), rtol=1e-4, atol=1e-5)
 
 

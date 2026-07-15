@@ -42,6 +42,7 @@ def _paged_attention_kernel(
     out_ptr,
     block_tables_ptr,
     seq_lens_ptr,
+    win_starts_ptr,
     scale,
     stride_qs,
     stride_qh,
@@ -63,10 +64,12 @@ def _paged_attention_kernel(
     GROUP_PAD: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    SINKS: tl.constexpr,
 ):
     seq = tl.program_id(0)
     kv_head = tl.program_id(1)
     seq_len = tl.load(seq_lens_ptr + seq)
+    win_start = tl.load(win_starts_ptr + seq)
 
     g = tl.arange(0, GROUP_PAD)
     d = tl.arange(0, HEAD_DIM)
@@ -84,7 +87,14 @@ def _paged_attention_kernel(
     acc_norm = tl.zeros([GROUP_PAD], tl.float32)
     acc = tl.zeros([GROUP_PAD, HEAD_DIM], tl.float32)
 
-    for b in range(0, tl.cdiv(seq_len, BLOCK_SIZE)):
+    # The visible set is two disjoint token ranges — [0, SINKS) and
+    # [win_start, seq_len) with win_start >= SINKS — walked as two block-table
+    # passes. Full attention is SINKS=0, win_start=0: pass one is empty at
+    # compile time and pass two degenerates to the original loop. Blocks
+    # strictly between the sink prefix and the window are never loaded, which
+    # is what lets the block manager reclaim them (their table entries may
+    # dangle).
+    for b in range(0, tl.cdiv(SINKS, BLOCK_SIZE)):
         block_id = tl.load(block_tables_ptr + seq * stride_bts + b * stride_btb).to(tl.int64)
         k_tile = tl.load(
             k_ptr
@@ -95,7 +105,36 @@ def _paged_attention_kernel(
         ).to(tl.float32)
         scores = tl.sum(q[:, None, :] * k_tile[None, :, :], axis=2) * scale
         token_idx = b * BLOCK_SIZE + s
-        scores = tl.where(token_idx[None, :] < seq_len, scores, float("-inf"))
+        visible = (token_idx[None, :] < SINKS) & (token_idx[None, :] < seq_len)
+        scores = tl.where(visible, scores, float("-inf"))
+
+        m_new = tl.maximum(m, tl.max(scores, axis=1))
+        rescale = tl.exp(m - m_new)
+        p = tl.exp(scores - m_new[:, None])
+        acc_norm = acc_norm * rescale + tl.sum(p, axis=1)
+        v_tile = tl.load(
+            v_ptr
+            + block_id * stride_vb
+            + s[:, None] * stride_vs
+            + kv_head * stride_vh
+            + d[None, :] * stride_vd
+        ).to(tl.float32)
+        acc = acc * rescale[:, None] + tl.sum(p[:, :, None] * v_tile[None, :, :], axis=1)
+        m = m_new
+
+    for b in range(win_start // BLOCK_SIZE, tl.cdiv(seq_len, BLOCK_SIZE)):
+        block_id = tl.load(block_tables_ptr + seq * stride_bts + b * stride_btb).to(tl.int64)
+        k_tile = tl.load(
+            k_ptr
+            + block_id * stride_kb
+            + s[:, None] * stride_ks
+            + kv_head * stride_kh
+            + d[None, :] * stride_kd
+        ).to(tl.float32)
+        scores = tl.sum(q[:, None, :] * k_tile[None, :, :], axis=2) * scale
+        token_idx = b * BLOCK_SIZE + s
+        visible = (token_idx[None, :] >= win_start) & (token_idx[None, :] < seq_len)
+        scores = tl.where(visible, scores, float("-inf"))
 
         m_new = tl.maximum(m, tl.max(scores, axis=1))
         rescale = tl.exp(m - m_new)
@@ -126,6 +165,8 @@ def paged_attention_decode(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     scale: float,
+    win_starts: torch.Tensor | None = None,
+    sinks: int = 0,
 ) -> torch.Tensor:
     """One decode step of paged attention, reading the block pool in place.
 
@@ -135,10 +176,16 @@ def paged_attention_decode(
             head_dim]``.
         v_cache: One layer's value pool, same shape as ``k_cache``.
         block_tables: ``[num_seqs, max_blocks_per_seq]`` int32; entries past a
-            sequence's block count may be any valid block id (they are masked).
+            sequence's block count may be any valid block id (they are masked),
+            and entries for blocks wholly outside the visible set (between the
+            sink prefix and the window) may dangle — they are never loaded.
         seq_lens: ``[num_seqs]`` int32 total lengths including the new token,
             whose K/V must already be written to the pool.
         scale: Softmax scale, ``head_dim ** -0.5``.
+        win_starts: ``[num_seqs]`` int32 first visible position of each row's
+            recency band (``AttentionPolicy.band_start(seq_len - 1)``), already
+            clipped to ``>= sinks``; ``None`` means full visibility.
+        sinks: Always-visible prefix length shared by all rows.
 
     Returns:
         Attention output ``[num_seqs, num_q_heads, head_dim]`` in ``q``'s dtype.
@@ -148,6 +195,8 @@ def paged_attention_decode(
     group = num_q_heads // num_kv_heads
     if head_dim & (head_dim - 1) or block_size & (block_size - 1):
         raise ValueError(f"head_dim ({head_dim}) and block_size ({block_size}) must be powers of 2")
+    if win_starts is None:
+        win_starts = torch.zeros(num_seqs, dtype=torch.int32, device=q.device)
 
     out = torch.empty_like(q)
     grid = (num_seqs, num_kv_heads)
@@ -158,6 +207,7 @@ def paged_attention_decode(
         out,
         block_tables,
         seq_lens,
+        win_starts,
         scale,
         *q.stride(),
         *k_cache.stride(),
@@ -168,6 +218,7 @@ def paged_attention_decode(
         GROUP_PAD=triton.next_power_of_2(group),
         BLOCK_SIZE=block_size,
         HEAD_DIM=head_dim,
+        SINKS=sinks,
         num_warps=4,
     )
     return out
@@ -197,11 +248,15 @@ class TritonPagedDecodeContext:
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         slots: torch.Tensor,
+        win_starts: torch.Tensor | None = None,
+        sinks: int = 0,
     ) -> None:
         self._cache = cache
         self._block_tables = block_tables
         self._seq_lens = seq_lens
         self._slots = slots
+        self._win_starts = win_starts
+        self._sinks = sinks
 
     def attend(
         self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
@@ -220,5 +275,7 @@ class TritonPagedDecodeContext:
             self._block_tables,
             self._seq_lens,
             scale=q.shape[-1] ** -0.5,
+            win_starts=self._win_starts,
+            sinks=self._sinks,
         )
         return out.unsqueeze(2)

@@ -88,12 +88,17 @@ the theory wants), so speculation measures 0.74× at k=2 with 57% acceptance; th
 predicted and measured slowdowns agree, which is the point. Design notes:
 [design/005-speculative-decoding.md](design/005-speculative-decoding.md).
 
-## M6 — Benchmark against vLLM ⬜
+## M6 — Benchmark against vLLM ✅
 
-Throughput, latency (TTFT / ITL), and goodput comparison against vLLM on identical
-hardware and workloads (ShareGPT-style traces), with an honest analysis of where the
-gap comes from — kernels, scheduling, memory management — and what it would take to
-close it.
+Throughput and latency comparison against vLLM on identical hardware and
+byte-identical workloads (the seeded chat-like trace both engines import from
+`benchmarks/workload.py`; raw token ids, so content and tokenization are
+controlled), run under WSL2, with the gap decomposed by vLLM's own switches:
+5.5× total = 2.12× kernels/engine (eager vs. eager, matched concurrency)
+× 2.33 CUDA graphs × 1.11 admission headroom. Per-request TTFT/ITL is reported
+tokamak-side only — vLLM 0.10's offline API (the newest this machine's driver
+runs) does not expose it. Analysis and what closing each factor would take:
+[design/006-vllm-gap-analysis.md](design/006-vllm-gap-analysis.md).
 
 **Exit criteria:** reproducible benchmark scripts, published numbers, and a written
 gap analysis.

@@ -178,14 +178,47 @@ Reproduce with:
 uv run python benchmarks/benchmark_latency.py --prompt-tokens 512 --new-tokens 128
 ```
 
+## vLLM comparison (`benchmark_vllm.py`, M6)
+
+Same GPU, same model and dtype, byte-identical requests: both engines import
+the seeded workload from `workload.py` and receive raw prompt token ids, so
+tokenization is out of the picture. Run under WSL2 (vLLM does not support
+native Windows), which changes tokamak's own numbers versus the Windows tables
+above — the identical configuration decodes 34% faster under Linux (236.8 vs
+176.6 tok/s) because WDDM's kernel-submission path is more expensive, a free
+preview of the comparison's conclusion. vLLM is pinned to 0.10.0, the last
+release whose torch build matches this machine's CUDA 12.7 driver cap. vLLM's
+offline API does not expose per-request TTFT at this version, so the
+cross-engine columns are wall clock and throughput only.
+
+| Config | Wall (s) | Out tok/s | vs. tokamak best |
+|---|---|---|---|
+| tokamak continuous b=16 (Triton) | 12.3 | 236.8 | 1.00× |
+| vLLM eager, max_num_seqs=16 | 5.8 | 502.1 | 2.12× |
+| vLLM CUDA graphs, max_num_seqs=16 | 2.5 | 1172.0 | 4.95× |
+| vLLM defaults (graphs, max_num_seqs=256) | 2.2 | 1303.2 | 5.50× |
+
+The two vLLM switches decompose the 5.5×: **2.12×** with execution model and
+concurrency matched (kernels + fused ops + engine loop), **×2.33** more from
+CUDA graphs alone (the launch-overhead floor a 0.6B decode step lives on),
+**×1.11** from admitting more than 16 sequences. The full decomposition and
+what it would take to close each factor:
+[docs/design/006-vllm-gap-analysis.md](../docs/design/006-vllm-gap-analysis.md).
+
+```bash
+# tokamak side (WSL2 venv with CUDA torch):
+python benchmarks/benchmark_throughput.py --attention-backend triton --batch-sizes 16
+# vLLM side (separate venv, vllm==0.10.0):
+python benchmarks/benchmark_vllm.py --enforce-eager --max-num-seqs 16
+python benchmarks/benchmark_vllm.py --max-num-seqs 16
+python benchmarks/benchmark_vllm.py
+```
+
 ## Planned
 
-- **Throughput under concurrency** (M3): requests/s and token throughput vs. number
-  of concurrent requests, compared against static batching.
-- **vLLM comparison** (M6): TTFT / ITL / throughput on ShareGPT-style traces, run on
-  Linux (WSL2 or cloud) since vLLM does not support native Windows. tokamak and vLLM
-  will run the same model, dtype, and trace; the gap analysis lives in
-  `docs/design/` when it exists.
+- **Experimental attention backends** (M7): quality/throughput trade-offs of
+  sliding-window / sparse / linear-attention variants behind the engine's
+  attention abstraction.
 
 ## Methodology notes
 

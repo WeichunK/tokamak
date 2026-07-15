@@ -21,7 +21,7 @@ every milestone: **prove it correct, then measure what it buys.**
 | M3 | Continuous batching (iteration-level scheduling) | ✅ |
 | M4 | Custom Triton attention kernels | ✅ |
 | M5 | Speculative decoding (draft + rejection sampling) | ✅ |
-| M6 | Benchmark & gap analysis vs. vLLM | ⬜ |
+| M6 | Benchmark & gap analysis vs. vLLM | ✅ |
 | M7 | Experimental attention backends (sparse / linear attention) | ⬜ |
 
 Details and exit criteria per milestone: [docs/ROADMAP.md](docs/ROADMAP.md).
@@ -113,9 +113,12 @@ counterpoint: the algorithm is verified exactly (40k-round distribution tests,
 token-identical greedy), yet it *loses* on this stack (0.74× at k=2) — because
 every decode step pays the same launch-overhead floor, the draft:target
 step-cost ratio is ~0.7 where the theory needs ~0.2, and the predicted and
-measured slowdowns agree. The M6 comparison against vLLM (same model, same
-traces, same GPU) comes with an honest analysis of the gap and where it comes
-from.
+measured slowdowns agree. The M6 comparison against vLLM (same GPU,
+byte-identical requests) lands at 5.5× behind vLLM's defaults — decomposed one
+vLLM flag at a time into 2.12× kernels + engine loop, 2.33× CUDA graphs, and
+1.11× admission headroom. The largest factor is the launch-overhead mechanism
+M1 identified, and the [gap analysis](docs/design/006-vllm-gap-analysis.md)
+prices what closing each piece would take.
 
 ## Development
 

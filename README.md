@@ -22,7 +22,7 @@ every milestone: **prove it correct, then measure what it buys.**
 | M4 | Custom Triton attention kernels | ✅ |
 | M5 | Speculative decoding (draft + rejection sampling) | ✅ |
 | M6 | Benchmark & gap analysis vs. vLLM | ✅ |
-| M7 | Experimental attention backends (sparse / linear attention) | ⬜ |
+| M7 | Experimental attention backends (sliding window + sinks) | ✅ |
 
 Details and exit criteria per milestone: [docs/ROADMAP.md](docs/ROADMAP.md).
 Design notes: [docs/design/](docs/design/). Article drafts per milestone:
@@ -118,7 +118,11 @@ byte-identical requests) lands at 5.5× behind vLLM's defaults — decomposed on
 vLLM flag at a time into 2.12× kernels + engine loop, 2.33× CUDA graphs, and
 1.11× admission headroom. The largest factor is the launch-overhead mechanism
 M1 identified, and the [gap analysis](docs/design/006-vllm-gap-analysis.md)
-prices what closing each piece would take.
+prices what closing each piece would take. M7's attention policies get the
+same treatment: a sliding window alone is a measured catastrophe (+719%
+perplexity), window-plus-4-sinks costs +3.1% at a quarter of the KV — and that
+bounded residency, reclaimed block by block, is worth a measured 1.51×
+throughput when concurrent generations outgrow a shared pool.
 
 ## Development
 

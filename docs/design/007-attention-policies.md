@@ -1,6 +1,11 @@
 # 007 — Experimental attention backends (M7): policies, not architectures
 
-**Status:** in progress
+**Status:** complete
+**Headline:** on a pretrained dense model, a sliding window alone is
+catastrophic (+719% perplexity at a 1024-token budget) while the same window
+plus 4 sink tokens costs +3.1% — and bounded visibility converts, via paged
+block reclamation, into a measured **1.51× throughput win** when concurrent
+long generations outgrow a shared pool (5.7× lower per-sequence KV residency).
 **Scope:** inference-time attention *policies* — restrictions on which cached
 positions a query may see — as pluggable backends behind the engine's existing
 attention seam, with measured quality/memory/throughput trade-offs on a
@@ -88,4 +93,65 @@ The measured claims to produce:
 
 ## Results
 
-_(pending implementation)_
+RTX 3080 Laptop (WSL2 numbers are not comparable — these ran on Windows),
+Qwen3-0.6B bf16, Triton decode backend.
+
+**Quality** (`benchmark_quality.py`): teacher-forced perplexity over 16,384
+tokens of *War and Peace* in 4,096-token segments.
+
+| Policy | KV budget | PPL | vs. full |
+|---|---|---|---|
+| full | 4,096 | 26.65 | — |
+| window:1024 | 1,024 | 218.26 | +719% |
+| window:512 | 512 | 397.89 | +1,393% |
+| window:256 | 256 | 726.78 | +2,627% |
+| streaming:1024+4 | 1,028 | 27.47 | **+3.1%** |
+| streaming:512+4 | 516 | 29.05 | **+9.0%** |
+| streaming:256+4 | 260 | 31.76 | **+19.2%** |
+
+The StreamingLLM curve reproduces exactly: evicting the earliest positions is
+what breaks a window (softmax has nowhere to park surplus attention mass), and
+4 pinned tokens — 0.1% of the context — buy back almost the entire collapse.
+This doubles as an end-to-end correctness check on every mask and kernel path:
+no plausible masking bug produces *this* pattern.
+
+**Single sequence, deep context** (`benchmark_streaming.py`): 3,072 greedy
+tokens; "deep" isolates tokens 1,024–3,072.
+
+| Policy | tok/s overall | tok/s deep | Peak KV tokens |
+|---|---|---|---|
+| full | 22.3 | 22.3 | 3,088 |
+| window:512 | 21.9 | 21.4 | 528 |
+| streaming:512+4 | 22.6 | 24.4 | **544** |
+
+Residency drops 5.7×; throughput does not move. Honest and expected: at batch
+1 this stack sits on the M1 launch-overhead floor (~45 ms/step on Windows), and
+a 3k-context attention read on a 0.6B model costs a rounding error against it.
+Windowing buys *memory*, and memory only becomes *time* when something
+contends for it —
+
+**Concurrent generations against a shared pool**: 8 requests × 2,048 new
+tokens racing for an 8,192-token pool (each full-attention sequence peaks at
+~2,100 tokens of residency, so at most ~4 fit; windowed residency is ~540).
+
+| Policy | Wall (s) | Out tok/s | |
+|---|---|---|---|
+| full | 144.9 | 113.1 | pool thrash: admission stalls + preemption-by-recompute |
+| window:512 | 97.5 | 168.1 | 1.49× |
+| streaming:512+4 | 95.7 | 171.2 | **1.51×** |
+
+The paged dividend, measured: reclamation keeps every sequence's footprint
+near ``sinks + window``, the same pool admits all 8 at once, and the scheduler
+stops burning steps on recompute. Quality cost of that 1.51×: +9% PPL.
+
+## What M7 does not claim
+
+- No position rolling: evaluation stays within the trained context (4,096 ≪
+  Qwen3's 40k); these policies bound cache, they do not extend context.
+- The single-sequence table does not show windowed attention beating full on
+  *speed* — on this launch-bound stack at this model scale it cannot, and the
+  numbers say so plainly.
+- DSA / Gated DeltaNet remain out of scope for the reason in the scoping
+  section: without natively-trained weights their quality column would be
+  meaningless. Supporting a hybrid-architecture model family is the honest
+  follow-up.

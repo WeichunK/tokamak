@@ -103,9 +103,16 @@ runs) does not expose it. Analysis and what closing each factor would take:
 **Exit criteria:** reproducible benchmark scripts, published numbers, and a written
 gap analysis.
 
-## M7 — Experimental attention backends (stretch) ⬜
+## M7 — Experimental attention backends (stretch) ✅
 
-The engine's attention abstraction reused for efficiency-oriented attention variants
-(e.g. sliding-window attention, DeepSeek sparse attention, Gated DeltaNet-style linear
-attention) as pluggable experimental backends, with quality/throughput trade-off
-measurements.
+Attention *policies* (sliding window, window + StreamingLLM sinks) behind the
+engine's attention seam: banded masks in the SDPA contexts, a two-phase
+block-table walk in the Triton kernel, and mid-flight reclamation of blocks
+behind the window. Measured trade-offs: window-only collapses perplexity
+(+719% at budget 1024) while +4 sinks holds it to +3.1%; residency drops 5.7×;
+and when 8 concurrent long generations share a pool the reclaimed capacity is
+worth 1.51× throughput at +9% PPL. DSA / Gated DeltaNet were deliberately
+descoped — retrofitting training-time architectures onto a dense checkpoint
+yields meaningless quality numbers; a natively-trained hybrid model family is
+the honest follow-up. Design notes:
+[design/007-attention-policies.md](design/007-attention-policies.md).

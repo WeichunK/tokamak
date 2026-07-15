@@ -214,11 +214,51 @@ python benchmarks/benchmark_vllm.py --max-num-seqs 16
 python benchmarks/benchmark_vllm.py
 ```
 
+## Attention policies (`benchmark_quality.py`, `benchmark_streaming.py`, M7)
+
+Windowed attention policies (`window:W`, `streaming:W+S` with S always-visible
+sink tokens) are inference-time approximations of a dense model, so the first
+measurement is what they *cost*: teacher-forced perplexity over 16,384 tokens
+of long text (4,096-token segments, banded-causal masks reproducing exactly
+the visibility a windowed decode would have).
+
+| Policy | KV budget | PPL | vs. full |
+|---|---|---|---|
+| full | 4,096 | 26.65 | — |
+| window:1024 | 1,024 | 218.26 | +719% |
+| window:512 | 512 | 397.89 | +1,393% |
+| window:256 | 256 | 726.78 | +2,627% |
+| streaming:1024+4 | 1,028 | 27.47 | **+3.1%** |
+| streaming:512+4 | 516 | 29.05 | **+9.0%** |
+| streaming:256+4 | 260 | 31.76 | **+19.2%** |
+
+The StreamingLLM result reproduces exactly: a plain window collapses (softmax
+attention needs the earliest positions as a sink for surplus probability
+mass), and pinning 4 tokens buys nearly all of it back at 1/4 the KV.
+
+What bounded visibility buys back (`benchmark_streaming.py`): per-sequence KV
+residency is capped near `sinks + window` — dead blocks return to the pool
+mid-flight — which is memory at batch 1 and *throughput* under contention:
+
+| Scenario | full | streaming:512+4 | |
+|---|---|---|---|
+| 1 × 3,072 tokens: tok/s | 22.3 | 22.6 | flat — batch-1 decode sits on the launch-overhead floor |
+| 1 × 3,072 tokens: peak KV | 3,088 | 544 | **5.7× less residency** |
+| 8 × 2,048 tokens, 8,192-token pool: tok/s | 113.1 | 171.2 | **1.51×** — reclamation ends pool thrash |
+
+Full attention fits ~4 of the 8 sequences and preempts-by-recompute; the
+windowed pool runs all 8 concurrently. The 1.51× costs +9% PPL — a trade
+stated, not hidden. Analysis: [docs/design/007-attention-policies.md](../docs/design/007-attention-policies.md).
+
+```bash
+uv run python benchmarks/benchmark_quality.py
+uv run python benchmarks/benchmark_streaming.py
+```
+
 ## Planned
 
-- **Experimental attention backends** (M7): quality/throughput trade-offs of
-  sliding-window / sparse / linear-attention variants behind the engine's
-  attention abstraction.
+Milestones M1–M7 are complete; further backends (top-k block sparsity,
+natively-trained hybrid architectures) are future work beyond the roadmap.
 
 ## Methodology notes
 
